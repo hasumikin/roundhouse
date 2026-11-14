@@ -257,6 +257,7 @@ const PROBE_COPY: &str = r#"class ProbeCopy
   def call(env)
     status, headers, body = @app.call(env)
     return [status, headers.merge("x-copied" => "yes"), body] if env["PATH_INFO"] == "/copy"
+    headers["set-cookie"] = ["a=1", "b=2"] if env["PATH_INFO"] == "/array"
 
     [status, headers, body]
   end
@@ -286,6 +287,8 @@ module Main
     res.status = 200
     res.headers["x-request-id"] = "id"
     res.body = +"page"
+    # As main.rb copies a controller's own `response.headers["set-cookie"]`.
+    res.headers["set-cookie"] = "flash=1" if req.path == "/flash"
     res.set_cookies << COOKIE
   end
 end
@@ -300,6 +303,12 @@ raise "copy: #{{res.to_h}}" unless res.set_cookies == [COOKIE] && res.headers ==
 # The same Hash handed back: the cookie once, and not left among the headers.
 res = run("/articles")
 raise "same: #{{res.to_h}}" unless res.set_cookies == [COOKIE] && res.headers == {{ "x-request-id" => "id" }} && res.body == "page"
+# The same Hash with an Array of cookies the middleware set: one line each.
+res = run("/array")
+raise "array: #{{res.to_h}}" unless res.set_cookies == ["a=1", "b=2"] && res.headers == {{ "x-request-id" => "id" }}
+# A controller's own Set-Cookie header is handed up with the session cookie, not replaced by it.
+res = run("/flash")
+raise "flash: #{{res.to_h}}" unless res.set_cookies == ["flash=1", COOKIE] && res.headers == {{ "x-request-id" => "id" }}
 puts "outermost cookies passed"
 "#
     );

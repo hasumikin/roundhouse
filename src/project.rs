@@ -10478,7 +10478,10 @@ module OutermostMiddleware
       @body = [@app_body]
       # Rails' Cookies middleware sits inside these, so the response they get carries the Set-Cookie lines.
       if @res.set_cookies.length > 0
-        @res.headers["set-cookie"] = @res.set_cookies.join("\n")
+        # Not overwritten: a controller's own `response.headers["set-cookie"]` is already among the headers.
+        handed = OutermostMiddleware.cookie_lines(@res.headers.delete("set-cookie"))
+        @res.set_cookies.each {{ |cookie| handed << cookie }}
+        @res.headers["set-cookie"] = handed.join("\n")
         @res.set_cookies.pop while @res.set_cookies.length > 0
       end
       [@res.status, @res.headers, @body]
@@ -10545,8 +10548,14 @@ module OutermostMiddleware
 {replace_headers}
   # The Set-Cookie lines the rest of the stack handed up in the headers, back onto the server's response.
   def self.take_set_cookies(res)
-    lines = res.headers.delete("set-cookie")
-    lines.to_s.split("\n").each {{ |cookie| res.set_cookies << cookie }} unless lines.nil?
+    OutermostMiddleware.cookie_lines(res.headers.delete("set-cookie")).each {{ |cookie| res.set_cookies << cookie }}
+  end
+
+  # A Set-Cookie value as Rack 3 gives it: an Array of lines, or lines joined by "\n".
+  # Not shared with replace_headers: that text is GemMiddleware's too, which stays as it is.
+  def self.cookie_lines(value)
+    return [] if value.nil?
+    value.is_a?(Array) ? value.map {{ |part| part.to_s }} : value.to_s.split("\n")
   end
 
   # Not given a request id or a session: Rails' RequestId and session middleware sit inside these.
