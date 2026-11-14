@@ -410,3 +410,71 @@ fn a_source_gems_class_inserted_at_0_stays_in_the_spinel_tree() {
     let defines_outer = |text: &String| text.contains("class GateGem::Outer") || (text.contains("module GateGem") && text.contains("class Outer"));
     assert!(sources.iter().any(defines_outer), "no GateGem::Outer in the Spinel tree");
 }
+
+const CONF_GEM: &str = "vendor/bundle/ruby/3.4.0/gems/conf_gem-0.1.0/lib";
+
+const CONF_GATE: &str = r#"module ConfGem
+  class Gate
+    attr_accessor :mode
+
+    def initialize(app)
+      @app = app
+      @mode = "plain"
+      yield self if block_given?
+    end
+
+    def call(env)
+      return [200, { "x-mode" => @mode }, []] if env["PATH_INFO"] == "/mode"
+
+      @app.call(env)
+    end
+  end
+end
+"#;
+
+/// The app's Spinel tree with the source gem conf_gem and `line` in the Application's class body: its runtime/gem_middleware.rb, and every emitted .rb file.
+fn conf_gem_tree(line: &str) -> (String, Vec<String>) {
+    let overlay = emit_and_run::real_blog()
+        .edit("Gemfile.lock", "    debug (1.11.1)\n", "    conf_gem (0.1.0)\n    debug (1.11.1)\n")
+        .edit("Gemfile.lock", "DEPENDENCIES\n", "DEPENDENCIES\n  conf_gem\n")
+        .write(".bundle/config", "---\nBUNDLE_PATH: \"vendor/bundle\"\n")
+        .write("roundhouse.yml", "extensions:\n  - config/roundhouse\n")
+        .write("config/roundhouse/gems.yml", "source_gems:\n  - {gem: \"conf_gem\"}\n")
+        .write(&format!("{CONF_GEM}/conf_gem.rb"), CONF_GATE)
+        .edit("config/application.rb", AUTOLOAD, &format!("{AUTOLOAD}{line}"));
+    let (tree, errors) = overlay.emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let stack = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
+    let mut sources = Vec::new();
+    let mut dirs = vec![tree.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rb") {
+                sources.push(std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    (stack, sources)
+}
+
+// Not the class's existence alone: the gem shake may keep `initialize` and still drop its `yield self if block_given?`.
+#[test]
+fn a_source_gems_middleware_used_with_a_block_keeps_its_block_given_branch() {
+    let (stack, sources) = conf_gem_tree("    config.middleware.use(ConfGem::Gate) { |gate| gate.mode = \"configured\" }\n");
+    assert!(stack.contains("ConfGem::Gate.new("), "{stack}");
+    let gate: Vec<&String> = sources.iter().filter(|text| text.contains("class Gate") || text.contains("class ConfGem::Gate")).collect();
+    assert!(!gate.is_empty(), "no ConfGem::Gate in the Spinel tree");
+    assert!(gate.iter().any(|text| text.contains("block_given?")), "the yield branch was dropped:\n{}", gate.iter().map(|t| t.as_str()).collect::<Vec<_>>().join("\n----\n"));
+}
+
+#[test]
+fn a_source_gems_middleware_inserted_at_0_with_a_block_keeps_its_block_given_branch() {
+    let (stack, sources) = conf_gem_tree("    config.middleware.insert_before(0, ConfGem::Gate) { |gate| gate.mode = \"configured\" }\n");
+    assert!(stack.contains("ConfGem::Gate.new("), "{stack}");
+    let gate: Vec<&String> = sources.iter().filter(|text| text.contains("class Gate") || text.contains("class ConfGem::Gate")).collect();
+    assert!(!gate.is_empty(), "no ConfGem::Gate in the Spinel tree");
+    assert!(gate.iter().any(|text| text.contains("block_given?")), "the yield branch was dropped:\n{}", gate.iter().map(|t| t.as_str()).collect::<Vec<_>>().join("\n----\n"));
+}
