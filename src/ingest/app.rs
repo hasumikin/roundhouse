@@ -9877,6 +9877,11 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
 /// added to `unharnessed`, and left out rather than emitted to fail at
 /// load.
 fn drop_unharnessed(app: &mut App, tm: &TestModule, path: &Path, unharnessed: &mut Vec<String>) -> bool {
+    // A reopen (`class NoticeTest` with no superclass) of a class already
+    // left out is the same class, still on its base.
+    if unharnessed.iter().any(|u| u == tm.name.0.as_str()) {
+        return true;
+    }
     let Some(base) = tm.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::")) else { return false };
     if !super::test::UNHARNESSED_TEST_BASES.contains(&base) && !unharnessed.iter().any(|u| u == base) {
         return false;

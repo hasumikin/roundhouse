@@ -132,10 +132,12 @@ fn ingest_test_class(
     // A class on a base with no harness is left out whole by the app
     // ingest (`drop_unharnessed`): its body is not read, so a construct
     // in it cannot fail the ingest that only means to report it.
-    let unharnessed = parent.as_ref().is_some_and(|p| {
-        let base = p.0.as_str().trim_start_matches("::");
-        UNHARNESSED_TEST_BASES.contains(&base) || TEST_CONCERNS.with(|c| c.borrow().unharnessed.iter().any(|u| u == base))
-    });
+    let left_out = |class: &str| TEST_CONCERNS.with(|c| c.borrow().unharnessed.iter().any(|u| u == class));
+    let unharnessed = left_out(name.0.as_str())
+        || parent.as_ref().is_some_and(|p| {
+            let base = p.0.as_str().trim_start_matches("::");
+            UNHARNESSED_TEST_BASES.contains(&base) || left_out(base)
+        });
     // Concerns `test_helper.rb` mixes into `ActiveSupport::TestCase`: a
     // class that derives from a framework base inherits their `included`
     // registrations ahead of its own, as a parent's callbacks run first.
@@ -1156,8 +1158,9 @@ fn ingest_test_declaration(
     stmt: &Node<'_>,
     file: &str,
 ) -> IngestResult<Option<Test>> {
-    // `def test_*; ...; end` form (vanilla Minitest).
-    if let Some(def) = stmt.as_def_node() {
+    // `def test_*; ...; end` form (vanilla Minitest). `def self.test_order`
+    // is a class method, not a test.
+    if let Some(def) = stmt.as_def_node().filter(|d| d.receiver().is_none()) {
         let name_bytes = def.name().as_slice();
         let Some(method_name) = std::str::from_utf8(name_bytes).ok() else {
             return Ok(None);
@@ -1730,8 +1733,8 @@ end
     // Neither is a test: Minitest's `self.test_order`, and `Kernel#test`.
     #[test]
     fn methods_named_like_tests_are_not_refused() {
-        let src = "class OrderTest < ActiveSupport::TestCase\n  class << self\n    def test_order\n      :alphabetical\n    end\n  end\n  READY = test(?e, __FILE__)\n  [1].each { |n| test(?d, n.to_s) }\n  define_method(:t) { 1 }\n\n  test \"runs\" do\n  end\n  { 1 => \"one\", \"1\" => \"string one\" }.each do |k, v|\n    test v do\n    end\n  end\nend\n";
-        assert_eq!(loop_test_names(src).expect("ingest"), ["runs", "one", "string one"]);
+        let src = "class OrderTest < ActiveSupport::TestCase\n  class << self\n    def test_order\n      :alphabetical\n    end\n  end\n  READY = test(?e, __FILE__)\n  [1].each { |n| test(?d, n.to_s) }\n  define_method(:t) { 1 }\n  def self.test_order\n    :alpha\n  end\n\n  test \"runs\" do\n  end\n  test \"order\" do\n  end\n  { 1 => \"one\", \"1\" => \"string one\" }.each do |k, v|\n    test v do\n    end\n  end\nend\n";
+        assert_eq!(loop_test_names(src).expect("ingest"), ["runs", "order", "one", "string one"]);
     }
 
     // A loop it cannot unroll is an error naming the file, not a drop.
@@ -1753,6 +1756,9 @@ end
             ("{ \"x\" => 1, \"x\" => 2 }.each do |k, v|\n    test \"#{k} #{v}\" do\n    end\n  end", "repeats a key"),
             ("[:test_generated].each do |m|\n    define_method(m) do\n    end\n  end", "holds more than `test` declarations"),
             ("%w[YouTube youtube].each do |n|\n    test n do\n    end\n  end", "would both be emitted as `test_youtube`"),
+            // One Ruby method; then two Ruby methods the emit names alike.
+            ("def test_a__b\n  end\n  test \"a__b\" do\n  end", "`test_a__b` is declared twice"),
+            ("def test_a__b\n  end\n  test \"a b\" do\n  end", "would both be emitted as `test_a_b`"),
             ("%w[one].each do |n|\n    test n do\n    end\n  end\n  test \"one\" do\n  end", "declared twice"),
             ("[-010].each do |n|\n    test \"n#{n}\" do\n    end\n  end", "not a plain literal"),
             ("%w[a b].each do |x|\n    %w[c d].each do |y|\n      test \"#{x}#{y}\" do\n      end\n    end\n  end", "holds more than `test` declarations"),

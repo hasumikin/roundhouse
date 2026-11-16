@@ -149,6 +149,8 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
             "test/mailers/kinds_mailer_test.rb",
             "class KindsMailerTest < ActionMailer::TestCase\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
         ),
+        // A reopen in a later file is the same class, still left out.
+        text_file("test/mailers/kinds_more_test.rb", "class KindsMailerTest\n  test \"more\" do\n  end\nend\n"),
     ])
     .expect("ingest tree");
     assert_modules(&app, &["ModelDefaultTest"]);
