@@ -36,11 +36,16 @@
 #   --out FILE    where to write (default bench/NAME/rails-baseline.json)
 #   --bundle DIR  BUNDLE_PATH for the app's gems
 #                 (default build/app-suite/NAME/bundle)
+#   --suite PATH  an rspec suite path, relative to the checkout
+#                 (repeatable; default: the recipe's `suites`). The
+#                 caller passes the SAME paths it ran on the emit side,
+#                 so the two runs describe one suite — lobsters-specs
+#                 hands its own --suite through here.
 #   --keep        keep the scratch copy and print its path
 #
 # Recipe keys read here: framework (minitest | rspec), src, suites
-# (rspec paths), rails_extra_gems, prepare (shell commands run in the
-# copy with RAILS_ENV=test before the suite).
+# (rspec paths, overridden by --suite), rails_extra_gems, prepare (shell
+# commands run in the copy with RAILS_ENV=test before the suite).
 #
 # Rows: name (`Class#test_x` as Minitest names it; rspec: the full
 # description), file, line, status (pass | fail | error | skip),
@@ -55,7 +60,7 @@ require "tmpdir"
 ROOT = File.expand_path("..", __dir__)
 PLUGIN_DIR = File.join(ROOT, "scripts", "lib")
 
-opts = { app: nil, src: nil, sha: nil, out: nil, bundle: nil, keep: false }
+opts = { app: nil, src: nil, sha: nil, out: nil, bundle: nil, suites: [], keep: false }
 args = ARGV.dup
 until args.empty?
   case (a = args.shift)
@@ -63,6 +68,7 @@ until args.empty?
   when "--sha"    then opts[:sha] = args.shift
   when "--out"    then opts[:out] = File.expand_path(args.shift)
   when "--bundle" then opts[:bundle] = File.expand_path(args.shift)
+  when "--suite"  then opts[:suites] << args.shift.to_s
   when "--keep"   then opts[:keep] = true
   when "-h", "--help"
     puts File.readlines(__FILE__).drop(1).take_while { _1.start_with?("#") }.map { _1.sub(/^# ?/, "") }
@@ -117,9 +123,15 @@ run!(env, %w[bundle install --jobs 8], chdir: copy)
 Array(recipe["prepare"]).each { |c| run!(env, ["bash", "-c", c], chdir: copy) }
 
 rows_file = File.join(work, "rows.json")
+suites =
+  if framework == "rspec"
+    # The caller's paths win over the recipe's: a caller that ran a
+    # subset on the emit side records the same subset here, or the join
+    # reads every example it left out as dropped.
+    opts[:suites].empty? ? Array(recipe["suites"]) : opts[:suites]
+  end
 command =
   if framework == "rspec"
-    suites = Array(recipe.fetch("suites"))
     ["bundle", "exec", "rspec", *suites, "--format", "json", "--out", rows_file]
   else
     %w[bin/rails test]
@@ -164,6 +176,8 @@ baseline = {
   "counts" => rows.map { _1["status"] }.tally.sort.to_h,
   "tests" => rows,
 }
+# Only an rspec recipe has suites; the key names the scope the rows cover.
+baseline["suites"] = suites if suites
 FileUtils.mkdir_p(File.dirname(out))
 File.write(out, JSON.pretty_generate(baseline) + "\n")
 counts = baseline["counts"].map { |k, v| "#{v} #{k}" }.join(", ")
