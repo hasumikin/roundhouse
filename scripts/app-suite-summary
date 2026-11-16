@@ -297,11 +297,14 @@ unclassified = []
 # `match` keys on the failure MESSAGE, which is the right key for anything
 # that raised. A divergence has no message of its own — every wrong answer
 # reads as an assertion failure — so a rule may also name the TEST, and
-# then both have to hold.
+# then both have to hold. `match_frame` keys on where it was raised (the
+# emitted `  at` line): one message ("constant not supported") raised in
+# two places is two causes.
 records.each do |r|
   rule = rules.find do |x|
     next false unless x["match"] && r["msg"] =~ Regexp.new(x["match"])
-    x["match_test"].nil? || r["test"] =~ Regexp.new(x["match_test"])
+    next false unless x["match_test"].nil? || r["test"] =~ Regexp.new(x["match_test"])
+    x["match_frame"].nil? || r["frame"].to_s =~ Regexp.new(x["match_frame"])
   end
   (rule ? buckets[rule["slug"]] : unclassified) << r
 end
