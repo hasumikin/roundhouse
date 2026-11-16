@@ -1,8 +1,9 @@
 //! The folders `bin/rails test` runs. Rails' default is
 //! `test/**/*_test.rb` less `test/{system,dummy,fixtures}`, so an
 //! integration test and a test in an app's own folder are part of the
-//! suite. Both files below were run first in the generated blog on
-//! Rails 8.1.4 (`bin/rails test`): 2 runs, 0 failures.
+//! suite, and a class-body loop declares one test per element. Both
+//! files below were run first in the generated blog on Rails 8.1.4
+//! (`bin/rails test`): 3 runs, 0 failures.
 
 use super::emit_and_run;
 
@@ -25,9 +26,11 @@ end
 const TITLES: &str = r##"require "test_helper"
 
 class ArticleTitleTest < ActiveSupport::TestCase
-  test "a title is kept" do
-    article = Article.create!(title: "Hi", body: "A body long enough to pass.")
-    assert_equal "Hi", article.reload.title
+  { "short" => "Hi", "spaced" => "Two words" }.each do |label, title|
+    test "a #{label} title is kept" do
+      article = Article.create!(title: title, body: "A body long enough to pass.")
+      assert_equal title, article.reload.title
+    end
   end
 end
 "##;
@@ -42,7 +45,8 @@ fn app() -> emit_and_run::Overlay {
 fn an_integration_test_and_a_custom_folder_run() {
     for (file, says) in [
         ("test/models/article_flow_test.rb", "ArticleFlowTest: 1 tests passed"),
-        ("test/models/article_title_test.rb", "ArticleTitleTest: 1 tests passed"),
+        // One test per element of the loop.
+        ("test/models/article_title_test.rb", "ArticleTitleTest: 2 tests passed"),
     ] {
         let run = app().run_test(file);
         run.assert_passes();

@@ -59,6 +59,14 @@ has no harness in the emitted tests (`ActionMailer::TestCase`,
 `ActionDispatch::SystemTestCase`) is reported as a warning and its
 tests are not emitted.
 
+A class-body loop that declares tests becomes one test per element
+when it is `each` over a literal Array or Hash of plain literals and
+each test's name is a string the loop's parameters complete
+(`test "#{name} is allowed"`). Any other class-body statement that
+declares tests (another loop, an `if`, a `define_method("test_…")`)
+is an error, as is a test whose name is not a string literal or
+repeats one the class already has. Those tests are not emitted.
+
 `test_paths` adds folders:
 
 ```yaml
