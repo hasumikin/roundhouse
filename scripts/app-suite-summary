@@ -20,18 +20,34 @@
 # those are exactly the interesting ones. So the unit is an UNPASSED TEST
 # (`total - passed` per file), attributed either to its own message or,
 # for an aborted file, to the file's load error carrying the weight of
-# every test that never ran. The cause counts sum to the unpassed total;
-# they are not a count of FAIL lines.
+# every test that never ran. The cause counts cover the unpassed total
+# MINUS the rows the join sets aside as environment; they are not a count
+# of FAIL lines.
+#
+# THE ROW JOIN. `--baseline` is Rails' own run of the same suite
+# (scripts/app-suite-baseline) and `--emit-tests` is what the emit
+# generated and ran. Joined row by row, a test Rails passes that the emit
+# never generated is DROPPED — no failure, no diagnostic, just a smaller
+# denominator — and a test that fails on Rails too is ENV. Both are
+# invisible in the tally alone. See `--baseline` below for the statuses.
 #
 # Usage:
 #   scripts/app-suite-summary --tally FILE [options]
 #
 #   --tally FILE      the `STATUS|file|passed|total|first-error` table
 #                     (required — it is the run)
-#   --fail-log FILE   the `file|Class#test|msg` per-test failures. Without
-#                     it every unpassed test in a file is attributed to
-#                     that file's first error, which over-credits the
-#                     first wall; the JSON records which was used.
+#   --fail-log FILE   the `file|Class#test|msg|ExceptionClass|frame`
+#                     per-test failures. Without it every unpassed test in
+#                     a file is attributed to that file's first error,
+#                     which over-credits the first wall; the JSON records
+#                     which was used.
+#   --emit-tests FILE the emitted tests the run generated and ran, one
+#                     `Class#test|status` per line (status pass, fail or
+#                     skip). app-suite writes it.
+#   --baseline FILE   Rails' own run of the suite, one row per test. The
+#                     join writes `rows`, `dropped`, `env` and `extra`;
+#                     without it those are null. Default
+#                     bench/<app>/rails-baseline.json when it exists.
 #   --emit-log FILE   the transpile's stderr, for the diagnostic counts
 #   --app NAME        recipe bench/NAME/app.json (default campfire); it
 #                     names the app and the causes file
@@ -58,7 +74,7 @@ require "open3"
 ROOT = File.expand_path("..", __dir__)
 
 opts = {
-  tally: nil, fail_log: nil, emit_log: nil,
+  tally: nil, fail_log: nil, emit_tests: nil, baseline: nil, emit_log: nil,
   app: "campfire", app_path: nil, sha: nil, target: "ruby",
   stubs: :default,
   out: File.join(ROOT, "build", "app-suite", "summary.json"),
@@ -68,6 +84,8 @@ until args.empty?
   case (a = args.shift)
   when "--tally"        then opts[:tally] = args.shift
   when "--fail-log"     then opts[:fail_log] = args.shift
+  when "--emit-tests"   then opts[:emit_tests] = args.shift
+  when "--baseline"     then opts[:baseline] = args.shift
   when "--emit-log"     then opts[:emit_log] = args.shift
   when "--app"          then opts[:app] = args.shift
   when "--app-path"     then opts[:app_path] = args.shift
@@ -89,6 +107,10 @@ RECIPE = File.join(ROOT, "bench", opts[:app], "app.json")
 recipe = File.exist?(RECIPE) ? (JSON.parse(File.read(RECIPE)) rescue {}) : {}
 CAUSES_FILE = File.join(ROOT, "bench", opts[:app], "suite-causes.json")
 opts[:stubs] = File.join(ROOT, "scripts", "#{opts[:app]}-walk-stubs.rb") if opts[:stubs] == :default
+# A baseline is only the default when it is there: a recipe with none is a
+# run that cannot join, not a mistake.
+default_baseline = File.join(ROOT, "bench", opts[:app], "rails-baseline.json")
+opts[:baseline] = default_baseline if opts[:baseline].nil? && File.exist?(default_baseline)
 
 def git(dir, *a)
   out, _, st = Open3.capture3("git", "-C", dir, *a)
@@ -137,9 +159,109 @@ if have_fail_log
   read_lines_scrubbed(opts[:fail_log]).each do |line|
     line = line.chomp
     next if line.empty?
-    file, rest = line.split("|", 2)
-    test, msg = rest.to_s.split(": ", 2)
-    fails_by_file[file.to_s] << { "test" => test.to_s, "msg" => msg.to_s.strip }
+    # `file|Class#test|msg|ExceptionClass|frame`. The message is field 3
+    # and a failure message may itself contain `|`, so the exception and
+    # frame are split off the END; -1 keeps a trailing empty field (the
+    # spinel lane writes no frame).
+    parts = line.split("|", -1)
+    next if parts.size < 5
+    fails_by_file[parts[0].to_s] << {
+      "test" => parts[1].to_s, "msg" => parts[2...-2].join("|").strip,
+      "exception" => parts[-2].to_s, "frame" => parts[-1].to_s,
+    }
+  end
+end
+
+# ── The join against Rails' own run ─────────────────────────────────
+# The tally says what the emit did; only Rails' baseline says what the
+# suite HAS. A test Rails passes that the emit never generated is
+# DROPPED — the quietest gap there is, because there is no failure to
+# count and the denominator quietly shrank. A test that fails on Rails
+# too is ENV: the environment, not the compiler, and it must not be
+# charged to a cause. The two sides are normalized the same way, because
+# the emitter downcases and sanitizes Minitest's names
+# (`test_loads_AVIF` -> `test_loads_avif`).
+row_key = lambda do |name|
+  klass, test = name.to_s.split("#", 2)
+  norm = test.to_s.downcase.gsub(/[^a-z0-9]+/, "_").gsub(/\A_|_\z/, "")
+  test.nil? ? norm : "#{klass}##{norm}"
+end
+
+emit_rows = {}
+have_emit_tests = !!(opts[:emit_tests] && File.exist?(opts[:emit_tests]))
+if have_emit_tests
+  read_lines_scrubbed(opts[:emit_tests]).each do |line|
+    line = line.chomp
+    next if line.empty?
+    name, status = line.split("|", 2)
+    emit_rows[row_key.(name)] = { "name" => name, "status" => status.to_s }
+  end
+end
+
+rows = nil
+dropped = []
+env = []
+extra = []
+env_keys = {}
+baseline_meta = nil
+if opts[:baseline].nil?
+  baseline_meta = {
+    "note" => "No Rails baseline at bench/#{opts[:app]}/rails-baseline.json; the row join did not run.",
+  }
+elsif !File.exist?(opts[:baseline])
+  abort "app-suite-summary: no baseline at #{opts[:baseline]}"
+elsif !have_emit_tests
+  baseline_meta = {
+    "note" => "No --emit-tests for this run, so there is nothing to join the baseline to.",
+  }
+else
+  baseline = JSON.parse(File.read(opts[:baseline]))
+  baseline_meta = {
+    "sha" => baseline["sha"], "rails" => baseline["rails"],
+    "ruby" => baseline["ruby"], "generated_at" => baseline["generated_at"],
+  }
+  run_sha = opts[:sha] || (opts[:app_path] && git(opts[:app_path], "rev-parse", "HEAD"))
+  short = ->(s) { s.to_s.empty? ? "an unknown commit" : s.to_s[0, 12] }
+  if baseline["sha"].to_s.empty? || run_sha.to_s.empty? || baseline["sha"] != run_sha
+    # A join across two commits is a fabricated number: tests move, and
+    # the answer would describe neither the baseline nor this emit.
+    baseline_meta["note"] = "Not joined: the baseline is Rails' run at #{short.(baseline["sha"])}, " \
+                            "this run is #{short.(run_sha)}."
+    warn "app-suite-summary: baseline #{short.(baseline["sha"])} does not match this run " \
+         "(#{short.(run_sha)}); writing rows: null"
+  else
+    counts = Hash.new(0)
+    baseline_keys = {}
+    Array(baseline["tests"]).each do |r|
+      key = row_key.(r["name"])
+      baseline_keys[key] = true
+      emit = emit_rows[key]
+      rails_status = r["status"].to_s
+      status =
+        if %w[fail error].include?(rails_status)
+          "env"
+        elsif rails_status == "skip" || (emit && emit["status"] == "skip")
+          "skip"
+        elsif emit.nil?
+          "dropped"
+        elsif emit["status"] == "pass"
+          "match"
+        else
+          "gap"
+        end
+      counts[status] += 1
+      env_keys[key] = true if status == "env"
+      dropped << { "name" => r["name"], "file" => r["file"] } if status == "dropped"
+      if status == "env"
+        env << { "name" => r["name"], "exception" => r["exception"], "message" => r["message"] }
+      end
+    end
+    # What the emit generated that Rails' suite does not have at all.
+    (emit_rows.keys - baseline_keys.keys).each do |key|
+      counts["extra"] += 1
+      extra << emit_rows[key]["name"]
+    end
+    rows = %w[match gap dropped env skip extra].to_h { |k| [k, counts[k]] }
   end
 end
 
@@ -152,8 +274,13 @@ by_file.each do |f|
   unpassed = f["failed"]
   next if unpassed <= 0
   listed = fails_by_file[f["file"]]
+  # First-match the file's own unpassed count against its per-test lines,
+  # THEN drop the env rows: the count already includes them, so filtering
+  # before the match would turn them into a phantom shortfall record.
   listed.first(unpassed).each do |t|
-    records << { "file" => f["file"], "test" => t["test"], "msg" => t["msg"], "weight" => 1 }
+    next if env_keys[row_key.(t["test"])]
+    records << { "file" => f["file"], "test" => t["test"], "msg" => t["msg"],
+                 "exception" => t["exception"], "frame" => t["frame"], "weight" => 1 }
   end
   short = unpassed - [listed.size, unpassed].min
   next if short <= 0
@@ -181,10 +308,15 @@ end
 
 weigh = ->(rs) { rs.sum { |r| r["weight"] } }
 unpassed_total = weigh.(records)
+# Dropped tests are a different kind of debt from unpassed ones — nothing
+# tried and failed, nothing was generated at all — but they belong on the
+# same worklist, so shares are of everything either kind accounts for.
+denominator = unpassed_total + dropped.size
 sample = lambda do |rs, n|
   rs.first(n).map do |r|
     { "example" => "#{r["file"]} · #{r["test"]}",
-      "error" => r["msg"].to_s[0, 200] }
+      "error" => r["msg"].to_s[0, 200],
+      "exception" => r["exception"].to_s, "frame" => r["frame"].to_s }
   end
 end
 
@@ -192,7 +324,7 @@ causes = rules.map do |x|
   hits = buckets[x["slug"]]
   { "slug" => x["slug"], "title" => x["title"], "owner" => x["owner"],
     "failures" => weigh.(hits),
-    "share" => unpassed_total.zero? ? 0.0 : (weigh.(hits).to_f / unpassed_total).round(4),
+    "share" => denominator.zero? ? 0.0 : (weigh.(hits).to_f / denominator).round(4),
     "note" => x["note"],
     # A rule at zero is three different facts. Reporting them as one sent
     # a cause the STUB covers (belongs-to-autosave, whose note says so)
@@ -204,13 +336,51 @@ causes = rules.map do |x|
     "examples" => sample.(hits, 5) }
 end.sort_by { |c| -c["failures"] }
 
+# ── Dropped rows, clustered for the worklist ───────────────────────
+# A directory the emit never ingests (test/integration, test/middleware)
+# is one decision, so it is one cause; a class that exists on both sides
+# but defines fewer emitted tests is a different one, so it clusters by
+# FILE even though its siblings in the same directory are fine.
+emit_classes = emit_rows.values.each_with_object({}) do |r, h|
+  h[r["name"].to_s.split("#", 2)[0]] = true
+end
+dropped_groups = Hash.new { |h, k| h[k] = [] }
+dropped.each do |d|
+  klass = d["name"].to_s.split("#", 2)[0]
+  key = emit_classes[klass] ? "dropped:#{d["file"]}" : "dropped:#{File.dirname(d["file"])}"
+  dropped_groups[key] << d
+end
+causes += dropped_groups.map do |slug, list|
+  where = slug.delete_prefix("dropped:")
+  n = list.size
+  if where.end_with?(".rb")
+    title = "Rails runs #{n} test#{n == 1 ? "" : "s"} in #{where} that the emit never generated"
+    note = "The class exists on both sides, but the emitted file defines fewer tests " \
+           "(a loop-generated test is the usual case), so these never entered the denominator above. " \
+           "They are not failures: nothing was attempted."
+  else
+    title = "Rails runs #{n} test#{n == 1 ? "" : "s"} under #{where}/ that the emit never generated"
+    note = "The emit ingests no test file under #{where}/, so these tests never entered the " \
+           "denominator above. They are not failures — nothing was attempted."
+  end
+  { "slug" => slug, "title" => title, "owner" => "compiler",
+    "failures" => n,
+    "share" => denominator.zero? ? 0.0 : (n.to_f / denominator).round(4),
+    "note" => note, "stale_rule" => false, "at_zero" => nil, "stubbed_zero" => false,
+    "examples" => list.first(5).map do |d|
+      { "example" => "#{d["name"]} · #{d["file"]}",
+        "error" => "the emit generated no test for it", "exception" => "", "frame" => "" }
+    end }
+end.sort_by { |c| -c["failures"] }
+causes.sort_by! { |c| -c["failures"] }
+
 # Untriaged is a first-class todo, not a rounding error: its size is how
 # much of the failure surface nobody has looked at yet.
 if unclassified.any?
   causes << {
     "slug" => "unclassified", "title" => "Not yet triaged", "owner" => "unknown",
     "failures" => weigh.(unclassified),
-    "share" => (weigh.(unclassified).to_f / unpassed_total).round(4),
+    "share" => denominator.zero? ? 0.0 : (weigh.(unclassified).to_f / denominator).round(4),
     "note" => "No rule in bench/#{opts[:app]}/suite-causes.json matches these. Triage, then add a rule.",
     "stale_rule" => false,
     "examples" => sample.(unclassified, 12),
@@ -366,17 +536,24 @@ out = {
   "stubs" => stubs,
   "attribution" => {
     "per_test" => have_fail_log,
-    "note" => !have_fail_log ?
+    "note" => (!have_fail_log ?
       "No --fail-log for this run: every unpassed test is attributed to its file's first error, " \
       "which over-credits the first wall in each file." :
       "Each unpassed test carries its own message; a file that never ran contributes its whole " \
-      "count against its load error.",
+      "count against its load error.") +
+      (env.empty? ? "" : " #{env.size} test(s) fail on Rails too and are set aside as environment, " \
+                         "not charged to a cause."),
   },
   "tests" => {
     "total" => by_file.sum { |f| f["tests"] },
     "passed" => by_file.sum { |f| f["passed"] },
-    "failed" => unpassed_total,
+    "failed" => by_file.sum { |f| f["failed"] },
   },
+  "rows" => rows,
+  "baseline" => baseline_meta,
+  "dropped" => dropped,
+  "env" => env,
+  "extra" => extra,
   "files" => {
     "total" => by_file.size,
     "green" => files_green,
@@ -404,4 +581,5 @@ warn "  #{out["tests"]["passed"]}/#{out["tests"]["total"]} tests · " \
      "#{files_green}/#{by_file.size} files green · " \
      "#{unbuilt.zero? ? "" : "#{unbuilt} never linked · "}" \
      "#{unpassed_total} unpassed across " \
-     "#{causes.count { |c| c["failures"] > 0 }} cause(s)"
+     "#{causes.count { |c| c["failures"] > 0 }} cause(s)" \
+     "#{rows ? " · #{rows["dropped"]} dropped, #{rows["env"]} env" : ""}"

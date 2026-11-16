@@ -114,10 +114,19 @@ attrib  = d["attribution"] || {}
 scope   = d["scope"] || {}
 causes  = d["causes"] || []
 by_file = d["by_file"] || []
+rows     = d["rows"]
+dropped  = Array(d["dropped"])
+env_rows = Array(d["env"])
+extra    = Array(d["extra"])
+baseline = d["baseline"] || {}
 
 total  = tests["total"].to_i
 passed = tests["passed"].to_i
 failed = tests["failed"].to_i
+# How many tests the suite HAS, as Rails ran it. `rows` is present only
+# when the join ran; its skipped/env/dropped rows are still tests Rails
+# runs, so they belong in the denominator this page reports against.
+rails_total = rows ? %w[match gap dropped env skip].sum { |k| rows[k].to_i } : nil
 
 generated = (Time.parse(d["generated_at"]) rescue nil)
 age_days = generated ? ((Time.now.utc - generated) / 86_400.0) : nil
@@ -271,6 +280,7 @@ end
 # ── Headline ─────────────────────────────────────────────────────────
 html << %(<div class="badges">)
 html << %(<span class="badge #{passed == total && total > 0 ? "pass" : "fail"}">#{fmt_int(passed)}/#{fmt_int(total)} tests pass</span>)
+html << %(<span class="badge info">of #{fmt_int(rails_total)} tests Rails runs</span>) if rails_total
 html << %(<span class="badge info">#{files["green"]} of #{files["total"]} files green</span>)
 if compiled && files["unbuilt"].to_i > 0
   html << %(<span class="badge fail">#{files["unbuilt"]} never linked</span>)
@@ -289,6 +299,7 @@ if total > 0
   html << %(<span class="f" style="width:#{pct(failed, total).round(2)}%"></span>)
   html << "</div>\n"
   html << %(<div class="meta">#{fmt_int(passed)} passing · #{fmt_int(failed)} not passing)
+  html << " · of #{fmt_int(rails_total)} tests Rails runs" if rails_total
   # On the compiled lane the never-linked files are a SUBSET of the
   # aborted ones (a file that did not compile did not run), so reporting
   # both raw reads as double-counting. Name the compile failures and let
@@ -328,7 +339,7 @@ pin_para =
   if compiled
     <<~PIN.strip
       <strong>The app is pinned#{app["sha"] ? " at <code>#{sha_short}</code>" : ""}; the compiler is not.</strong>
-      This lane compiles 54 whole programs, which is too much to run per commit, so it runs on a schedule
+      This lane compiles #{files["total"]} whole programs, which is too much to run per commit, so it runs on a schedule
       and its spinel is whatever the publisher pulled and built that morning. That makes a movement here
       two-sided: it belongs to a Roundhouse change <em>or</em> to a compiler change, and the two are told
       apart by the spinel version recorded above — not by this page. Read a regression by checking that
@@ -407,7 +418,9 @@ if live.any?
       html << %(<details><summary>#{shown}</summary><ul>)
       samples.each do |s|
         html << if s.is_a?(Hash)
-          "<li>#{esc(s["example"])}<br><code>#{esc(s["error"])}</code></li>"
+          detail = s["frame"].to_s.empty? ? "" :
+            %(<br><code>#{esc(s["exception"])} #{esc(s["frame"])}</code>)
+          "<li>#{esc(s["example"])}<br><code>#{esc(s["error"])}</code>#{detail}</li>"
         else
           "<li>#{esc(s)}</li>"
         end
@@ -499,6 +512,46 @@ if by_file.any?
     html << "</tr>\n"
   end
   html << "</table>\n"
+end
+
+# ── What Rails runs that the emit never ran ──────────────────────────
+# The join's headline finding. A dropped test is invisible in the tally
+# above — no failure, no diagnostic, just a smaller denominator — so it
+# gets its own section rather than a footnote on the pass count.
+if dropped.any?
+  html << "<h2>Tests Rails runs that the emit never ran</h2>\n"
+  html << %(<p>These are not failures: the emit generated no test for them at all, so they never entered the denominator above. A file the emit never ingested at all is one decision; a class that exists on both sides with fewer emitted tests is usually a loop-generated test.</p>\n)
+  html << "<table>\n<tr><th>File</th><th class=num>Tests</th></tr>\n"
+  dropped.group_by { |r| r["file"].to_s }
+         .sort_by { |file, list| [-list.size, file] }
+         .each do |file, list|
+    html << %(<tr><td><code>#{esc(file)}</code></td><td class=num>#{list.size}</td></tr>\n)
+  end
+  html << "</table>\n"
+end
+
+# ── Set aside: fails on Rails too ────────────────────────────────────
+if env_rows.any?
+  html << "<h2>Set aside: fails on Rails too</h2>\n"
+  html << %(<p>These fail on stock Rails, so they say nothing about the emit and are excluded from the cause counts above.</p>\n)
+  html << "<table>\n<tr><th>Test</th><th>Exception</th><th>Message</th></tr>\n"
+  env_rows.each do |r|
+    html << %(<tr><td><code>#{esc(r["name"])}</code></td><td>)
+    html << (r["exception"].to_s.empty? ? "—" : "<code>#{esc(r["exception"])}</code>")
+    html << %(</td><td>#{esc(r["message"])}</td></tr>\n)
+  end
+  html << "</table>\n"
+end
+
+# A note from the join itself: extra rows on the emit side, or the reason
+# there was no join at all (no baseline, or a baseline for another commit).
+if extra.any?
+  shown = extra.first(6).map { |n| "<code>#{esc(n)}</code>" }.join(", ")
+  shown += ", …" if extra.size > 6
+  html << %(<p class="caveat">#{extra.size} emitted test(s) have no row in Rails' suite: #{shown}.</p>\n)
+end
+if rows.nil? && baseline["note"]
+  html << %(<p class="caveat">#{esc(baseline["note"])}</p>\n)
 end
 
 # ── Emit diagnostics ─────────────────────────────────────────────────
