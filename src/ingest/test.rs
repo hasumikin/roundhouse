@@ -99,20 +99,27 @@ fn ingest_test_classes(
         test_nodes.push(helper_nodes.remove(first));
         return ingest_test_class(&test_nodes[0], &helper_nodes, file).map(|tm| vec![tm]);
     }
-    // Left out: a later class in this file on it (or reopening it) is
-    // left out too. Only for this file: the caller's list is put back.
-    let known = TEST_CONCERNS.with(|c| c.borrow().unharnessed.len());
+    // A later class in this file on one of these (or reopening it) sees
+    // it left out or kept. Only for this file: the caller's lists are
+    // put back.
+    let known = TEST_CONCERNS.with(|c| (c.borrow().unharnessed.len(), c.borrow().harnessed.len()));
     let modules: IngestResult<Vec<TestModule>> = test_nodes
         .iter()
         .map(|class| {
             let tm = ingest_test_class(class, &helper_nodes, file)?;
-            if tm.unharnessed.is_some() {
-                TEST_CONCERNS.with(|c| c.borrow_mut().unharnessed.push(tm.name.0.as_str().to_string()));
-            }
+            let name = tm.name.0.as_str().to_string();
+            TEST_CONCERNS.with(|c| {
+                let mut c = c.borrow_mut();
+                if tm.unharnessed.is_some() { c.unharnessed.push(name) } else { c.harnessed.push(name) }
+            });
             Ok(tm)
         })
         .collect();
-    TEST_CONCERNS.with(|c| c.borrow_mut().unharnessed.truncate(known));
+    TEST_CONCERNS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.unharnessed.truncate(known.0);
+        c.harnessed.truncate(known.1);
+    });
     modules
 }
 
@@ -150,7 +157,8 @@ fn ingest_test_class(
         parent.as_ref().map(|p| if rooted { format!("::{}", p.0) } else { p.0.to_string() })
     });
     let unharnessed_base = TEST_CONCERNS.with(|c| {
-        unharnessed_class(scope, name.0.as_str(), written.as_deref(), &c.borrow().unharnessed)
+        let c = c.borrow();
+        unharnessed_class(scope, name.0.as_str(), written.as_deref(), &c.unharnessed, &c.harnessed)
     });
     let unharnessed = unharnessed_base.is_some();
     // Concerns `test_helper.rb` mixes into `ActiveSupport::TestCase`: a
@@ -845,6 +853,9 @@ pub struct TestConcerns {
     /// `test/test_helper.rb` defines on `ActionMailer::TestCase`): a
     /// class on one has its body skipped as on a framework one.
     pub unharnessed: Vec<String>,
+    /// Test classes kept so far: a base resolved to one has a harness,
+    /// and shadows a left-out class of that name further out.
+    pub harnessed: Vec<String>,
 }
 
 thread_local! {
@@ -892,9 +903,16 @@ pub(crate) const UNHARNESSED_TEST_BASES: [&str; 4] = [
 /// already (a reopen): a framework base in [`UNHARNESSED_TEST_BASES`], or
 /// a class in `left_out`. A parent written relative to the enclosing
 /// modules (`Base` inside `module Mailers`) is looked up innermost module
-/// first, approximately as Ruby does: only against the left-out names,
-/// so a harnessed inner class does not shadow a left-out outer one.
-fn unharnessed_class(scope: &[String], name: &str, parent: Option<&str>, left_out: &[String]) -> Option<String> {
+/// first, approximately as Ruby does: the first candidate in `left_out`
+/// or in `kept` (test classes with a harness) decides, so a kept inner
+/// class shadows a left-out outer one.
+fn unharnessed_class(
+    scope: &[String],
+    name: &str,
+    parent: Option<&str>,
+    left_out: &[String],
+    kept: &[String],
+) -> Option<String> {
     let is_left_out = |class: &str| left_out.iter().any(|u| u == class);
     if is_left_out(name) {
         return Some(name.to_string());
@@ -907,6 +925,9 @@ fn unharnessed_class(scope: &[String], name: &str, parent: Option<&str>, left_ou
         let candidate = scope[..depth].iter().map(String::as_str).chain([parent]).collect::<Vec<_>>().join("::");
         if is_left_out(&candidate) {
             return Some(candidate);
+        }
+        if kept.contains(&candidate) {
+            return None;
         }
     }
     UNHARNESSED_TEST_BASES.contains(&parent).then(|| parent.to_string())

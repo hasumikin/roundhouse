@@ -157,7 +157,13 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
         text_file(
             "test/test_helper.rb",
             // `HelperChainTest` is on a base left out earlier in this file.
-            "class BaseMailerTest < ActionMailer::TestCase\nend\nclass HelperChainTest < BaseMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\nclass HarnessedBase < ActiveSupport::TestCase\nend\nmodule Mailers\n  class Base < ActionMailer::TestCase\n  end\n  class HarnessedBase < ActionMailer::TestCase\n  end\nend\n",
+            "class BaseMailerTest < ActionMailer::TestCase\nend\nclass HelperChainTest < BaseMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\nclass HarnessedBase < ActiveSupport::TestCase\nend\nclass OuterBase < ActionMailer::TestCase\nend\nmodule Mailers\n  class Base < ActionMailer::TestCase\n  end\n  class HarnessedBase < ActionMailer::TestCase\n  end\n  class OuterBase < ActiveSupport::TestCase\n  end\nend\n",
+        ),
+        // `OuterBase` here is the kept `Mailers::OuterBase`, which shadows
+        // the left-out top-level one.
+        text_file(
+            "test/mailers/mailers/shadowed_test.rb",
+            "module Mailers\n  class ShadowedTest < OuterBase\n    test \"kept\" do\n    end\n  end\nend\n",
         ),
         // A chain within one test file, and a reopen there.
         text_file(
@@ -182,7 +188,17 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
         ),
     ])
     .expect("ingest tree");
-    assert_modules(&app, &["ModelDefaultTest", "HarnessedBase", "Mailers::RootedTest", "Mailers::CompactTest"]);
+    assert_modules(
+        &app,
+        &[
+            "ModelDefaultTest",
+            "HarnessedBase",
+            "Mailers::OuterBase",
+            "Mailers::RootedTest",
+            "Mailers::CompactTest",
+            "Mailers::ShadowedTest",
+        ],
+    );
     let mut dropped: Vec<&str> = app.test_drops.iter().map(|d| d.message.split('`').nth(1).unwrap()).collect();
     dropped.sort();
     assert_eq!(
@@ -197,6 +213,7 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
             "Mailers::DigestTest < Mailers::Base",
             "Mailers::HarnessedBase < ActionMailer::TestCase",
             "NoticeTest < BaseMailerTest",
+            "OuterBase < ActionMailer::TestCase",
         ]
     );
 }

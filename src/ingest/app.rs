@@ -2630,7 +2630,7 @@ end
             .iter()
             .map(|s| s.as_str().trim_start_matches("::").to_string())
             .collect();
-        super::test::TestConcerns { concerns, case_wide, unharnessed: Vec::new() }
+        super::test::TestConcerns { concerns, case_wide, unharnessed: Vec::new(), harnessed: Vec::new() }
     };
 
     // Test classes left out for a base the emitted harness lacks.
@@ -2687,7 +2687,11 @@ end
             }
             continue;
         }
-        let concerns = super::test::TestConcerns { unharnessed: unharnessed.clone(), ..test_concerns.clone() };
+        let concerns = super::test::TestConcerns {
+            unharnessed: unharnessed.clone(),
+            harnessed: app.test_modules.iter().map(|tm| tm.name.0.as_str().to_string()).collect(),
+            ..test_concerns.clone()
+        };
         let ingested = super::test::with_test_concerns(concerns, || {
             ingest_test_files(&source, &entry.display().to_string())
         });
