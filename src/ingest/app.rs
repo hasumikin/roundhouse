@@ -2630,9 +2630,11 @@ end
             .iter()
             .map(|s| s.as_str().trim_start_matches("::").to_string())
             .collect();
-        super::test::TestConcerns { concerns, case_wide }
+        super::test::TestConcerns { concerns, case_wide, unharnessed: Vec::new() }
     };
 
+    // Test classes left out for a base the emitted harness lacks.
+    let mut unharnessed: Vec<String> = Vec::new();
     // A test-case base the helper DEFINES (`class GemCompat::TestCase
     // < ActiveSupport::TestCase`), which the app's tests then subclass. A
     // reopen (`class ActiveSupport::TestCase` with no superclass) is the
@@ -2643,6 +2645,9 @@ end
                 unwrap_or_record(ingest_test_bases(&source, &helper_rb.display().to_string()))?
             {
                 for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
+                    if drop_unharnessed(&mut app, &tm, &helper_rb, &mut unharnessed) {
+                        continue;
+                    }
                     splice_test_helpers(&mut tm, &shared_test_helpers);
                     app.test_modules.push(tm);
                 }
@@ -2679,19 +2684,13 @@ end
             }
             continue;
         }
-        let ingested = super::test::with_test_concerns(test_concerns.clone(), || {
+        let concerns = super::test::TestConcerns { unharnessed: unharnessed.clone(), ..test_concerns.clone() };
+        let ingested = super::test::with_test_concerns(concerns, || {
             ingest_test_files(&source, &entry.display().to_string())
         });
         if let Some(tms) = unwrap_or_record(ingested)? {
             for mut tm in tms {
-                if let Some(base) = tm.parent.as_ref().filter(|p| UNHARNESSED_TEST_BASES.contains(&p.0.as_str())) {
-                    app.test_drops.push(crate::app::IngestDrop {
-                        span: crate::span::Span { file: super::sources::file_id(&entry.display().to_string()), start: 0, end: 0 },
-                        message: format!(
-                            "`{} < {}`: the runtime has no {} harness, so its tests are not emitted",
-                            tm.name.0, base.0, base.0
-                        ),
-                    });
+                if drop_unharnessed(&mut app, &tm, &entry, &mut unharnessed) {
                     continue;
                 }
                 // A module every test case already includes, included
@@ -9871,16 +9870,24 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
     Ok(files)
 }
 
-/// Framework test-case bases the emitted test harness does not define
-/// (`runtime/spinel/test/test_helper.rb` has `ActiveSupport::TestCase`'s,
-/// the integration, controller, view and cable ones). A test class on one
-/// is reported and left out rather than emitted to fail at load.
-const UNHARNESSED_TEST_BASES: [&str; 4] = [
-    "ActionMailer::TestCase",
-    "ActiveJob::TestCase",
-    "ActionMailbox::TestCase",
-    "ActionDispatch::SystemTestCase",
-];
+/// Whether test class `tm` derives from a base the emitted harness lacks:
+/// a framework one ([`super::test::UNHARNESSED_TEST_BASES`]), or an app
+/// class `unharnessed` already holds for that reason (a base the test
+/// helper defines on one). Such a class is reported in `app.test_drops`,
+/// added to `unharnessed`, and left out rather than emitted to fail at
+/// load.
+fn drop_unharnessed(app: &mut App, tm: &TestModule, path: &Path, unharnessed: &mut Vec<String>) -> bool {
+    let Some(base) = tm.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::")) else { return false };
+    if !super::test::UNHARNESSED_TEST_BASES.contains(&base) && !unharnessed.iter().any(|u| u == base) {
+        return false;
+    }
+    app.test_drops.push(crate::app::IngestDrop {
+        span: crate::span::Span { file: super::sources::file_id(&path.display().to_string()), start: 0, end: 0 },
+        message: format!("`{} < {base}`: the emitted tests have no harness for {base}, so its tests are not emitted", tm.name.0),
+    });
+    unharnessed.push(tm.name.0.as_str().to_string());
+    true
+}
 
 /// The folders whose `.rb` files are all read as tests, beside the
 /// Rails default glob ([`rails_default_test_files`]).

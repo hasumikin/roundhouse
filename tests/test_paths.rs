@@ -129,7 +129,34 @@ fn rails_default_glob_reaches_every_test_folder() {
     let drops: Vec<&str> = app.test_drops.iter().map(|d| d.message.as_str()).collect();
     assert_eq!(
         drops,
-        ["`NoticeMailerTest < ActionMailer::TestCase`: the runtime has no ActionMailer::TestCase harness, so its tests are not emitted"]
+        ["`NoticeMailerTest < ActionMailer::TestCase`: the emitted tests have no harness for ActionMailer::TestCase, so its tests are not emitted"]
+    );
+}
+
+/// A base with no harness is reported however its class is reached: a
+/// base the helper defines on one, and a class on that base, are left
+/// out too, and a body construct the ingest would refuse is not read.
+#[test]
+fn an_unharnessed_base_is_reported_through_a_helper_base() {
+    let app = ingest_files([
+        ruby_file("test/models/model_default_test.rb", "ModelDefaultTest"),
+        text_file("test/test_helper.rb", "class BaseMailerTest < ActionMailer::TestCase\nend\n"),
+        text_file(
+            "test/mailers/notice_test.rb",
+            "class NoticeTest < BaseMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
+        ),
+        text_file(
+            "test/mailers/kinds_mailer_test.rb",
+            "class KindsMailerTest < ActionMailer::TestCase\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
+        ),
+    ])
+    .expect("ingest tree");
+    assert_modules(&app, &["ModelDefaultTest"]);
+    let mut dropped: Vec<&str> = app.test_drops.iter().map(|d| d.message.split('`').nth(1).unwrap()).collect();
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        ["BaseMailerTest < ActionMailer::TestCase", "KindsMailerTest < ActionMailer::TestCase", "NoticeTest < BaseMailerTest"]
     );
 }
 
