@@ -2641,9 +2641,12 @@ end
     // helper configuring Rails' own base, not a class of the app's.
     if vfs.exists(&helper_rb) {
         if let Some(source) = read_or_ledger(vfs, &helper_rb)? {
-            if let Some(tms) =
-                unwrap_or_record(ingest_test_bases(&source, &helper_rb.display().to_string()))?
-            {
+            // In a scope of its own, so a base left out for its base is
+            // known to the classes after it in the file.
+            let bases = super::test::with_test_concerns(super::test::TestConcerns::default(), || {
+                ingest_test_bases(&source, &helper_rb.display().to_string())
+            });
+            if let Some(tms) = unwrap_or_record(bases)? {
                 for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
                     if drop_unharnessed(&mut app, &tm, &helper_rb, &mut unharnessed) {
                         continue;
@@ -9870,22 +9873,20 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
     Ok(files)
 }
 
-/// Whether test class `tm` derives from a base the emitted harness lacks:
-/// a framework one ([`super::test::UNHARNESSED_TEST_BASES`]), or an app
-/// class `unharnessed` already holds for that reason (a base the test
-/// helper defines on one). Such a class is reported in `app.test_drops`,
-/// added to `unharnessed`, and left out rather than emitted to fail at
-/// load.
+/// Whether test class `tm` derives from a base the emitted harness lacks
+/// (`TestModule::unharnessed`, resolved at ingest against the framework
+/// bases and the app classes `unharnessed` holds). Such a class is
+/// reported in `app.test_drops`, added to `unharnessed`, and left out
+/// rather than emitted to fail at load.
 fn drop_unharnessed(app: &mut App, tm: &TestModule, path: &Path, unharnessed: &mut Vec<String>) -> bool {
-    // A reopen (`class NoticeTest` with no superclass) of a class already
-    // left out is the same class, still on its base.
-    if unharnessed.iter().any(|u| u == tm.name.0.as_str()) {
-        return true;
-    }
-    let Some(base) = tm.parent.as_ref().map(|p| p.0.as_str().trim_start_matches("::")) else { return false };
-    if !super::test::UNHARNESSED_TEST_BASES.contains(&base) && !unharnessed.iter().any(|u| u == base) {
-        return false;
-    }
+    let name = tm.name.0.as_str();
+    let base = match tm.unharnessed.as_ref().map(|b| b.0.as_str()) {
+        None => return false,
+        // A reopen (`class NoticeTest` with no superclass) of a class
+        // already left out is the same class, still on its base.
+        Some(found) if found == name => return true,
+        Some(base) => base,
+    };
     app.test_drops.push(crate::app::IngestDrop {
         span: crate::span::Span { file: super::sources::file_id(&path.display().to_string()), start: 0, end: 0 },
         message: format!("`{} < {base}`: the emitted tests have no harness for {base}, so its tests are not emitted", tm.name.0),

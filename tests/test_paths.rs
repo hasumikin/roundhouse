@@ -140,7 +140,6 @@ fn rails_default_glob_reaches_every_test_folder() {
 fn an_unharnessed_base_is_reported_through_a_helper_base() {
     let app = ingest_files([
         ruby_file("test/models/model_default_test.rb", "ModelDefaultTest"),
-        text_file("test/test_helper.rb", "class BaseMailerTest < ActionMailer::TestCase\nend\n"),
         text_file(
             "test/mailers/notice_test.rb",
             "class NoticeTest < BaseMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
@@ -149,16 +148,56 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
             "test/mailers/kinds_mailer_test.rb",
             "class KindsMailerTest < ActionMailer::TestCase\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
         ),
-        // A reopen in a later file is the same class, still left out.
-        text_file("test/mailers/kinds_more_test.rb", "class KindsMailerTest\n  test \"more\" do\n  end\nend\n"),
+        // A reopen in a later file is the same class, still left out, its
+        // body (a loop the ingest would refuse) unread.
+        text_file(
+            "test/mailers/kinds_more_test.rb",
+            "class KindsMailerTest\n  MORE.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
+        ),
+        text_file(
+            "test/test_helper.rb",
+            // `HelperChainTest` is on a base left out earlier in this file.
+            "class BaseMailerTest < ActionMailer::TestCase\nend\nclass HelperChainTest < BaseMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\nclass HarnessedBase < ActiveSupport::TestCase\nend\nmodule Mailers\n  class Base < ActionMailer::TestCase\n  end\n  class HarnessedBase < ActionMailer::TestCase\n  end\nend\n",
+        ),
+        // A chain within one test file, and a reopen there.
+        text_file(
+            "test/mailers/chain_test.rb",
+            "class LocalMailerTest < ActionMailer::TestCase\nend\nclass ChainTest < LocalMailerTest\n  KINDS.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\nclass LocalMailerTest\n  MORE.each do |kind|\n    test \"#{kind}\" do\n    end\n  end\nend\n",
+        ),
+        // Compact `class Mailers::CompactTest` looks `HarnessedBase` up at
+        // the top level only, where it has a harness.
+        text_file(
+            "test/mailers/mailers/compact_test.rb",
+            "class Mailers::CompactTest < HarnessedBase\n  test \"kept\" do\n  end\nend\n",
+        ),
+        // `Base` is `Mailers::Base` only by Ruby's lookup in the module.
+        text_file(
+            "test/mailers/mailers/digest_test.rb",
+            "module Mailers\n  class DigestTest < Base\n    KINDS.each do |kind|\n      test \"#{kind}\" do\n      end\n    end\n  end\nend\n",
+        ),
+        // `::HarnessedBase` is the top-level one, whatever the module holds.
+        text_file(
+            "test/mailers/mailers/rooted_test.rb",
+            "module Mailers\n  class RootedTest < ::HarnessedBase\n    test \"kept\" do\n    end\n  end\nend\n",
+        ),
     ])
     .expect("ingest tree");
-    assert_modules(&app, &["ModelDefaultTest"]);
+    assert_modules(&app, &["ModelDefaultTest", "HarnessedBase", "Mailers::RootedTest", "Mailers::CompactTest"]);
     let mut dropped: Vec<&str> = app.test_drops.iter().map(|d| d.message.split('`').nth(1).unwrap()).collect();
     dropped.sort();
     assert_eq!(
         dropped,
-        ["BaseMailerTest < ActionMailer::TestCase", "KindsMailerTest < ActionMailer::TestCase", "NoticeTest < BaseMailerTest"]
+        [
+            "BaseMailerTest < ActionMailer::TestCase",
+            "ChainTest < LocalMailerTest",
+            "HelperChainTest < BaseMailerTest",
+            "KindsMailerTest < ActionMailer::TestCase",
+            "LocalMailerTest < ActionMailer::TestCase",
+            "Mailers::Base < ActionMailer::TestCase",
+            "Mailers::DigestTest < Mailers::Base",
+            "Mailers::HarnessedBase < ActionMailer::TestCase",
+            "NoticeTest < BaseMailerTest",
+        ]
     );
 }
 

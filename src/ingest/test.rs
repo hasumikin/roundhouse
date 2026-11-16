@@ -99,10 +99,21 @@ fn ingest_test_classes(
         test_nodes.push(helper_nodes.remove(first));
         return ingest_test_class(&test_nodes[0], &helper_nodes, file).map(|tm| vec![tm]);
     }
-    test_nodes
+    // Left out: a later class in this file on it (or reopening it) is
+    // left out too. Only for this file: the caller's list is put back.
+    let known = TEST_CONCERNS.with(|c| c.borrow().unharnessed.len());
+    let modules: IngestResult<Vec<TestModule>> = test_nodes
         .iter()
-        .map(|class| ingest_test_class(class, &helper_nodes, file))
-        .collect()
+        .map(|class| {
+            let tm = ingest_test_class(class, &helper_nodes, file)?;
+            if tm.unharnessed.is_some() {
+                TEST_CONCERNS.with(|c| c.borrow_mut().unharnessed.push(tm.name.0.as_str().to_string()));
+            }
+            Ok(tm)
+        })
+        .collect();
+    TEST_CONCERNS.with(|c| c.borrow_mut().unharnessed.truncate(known));
+    modules
 }
 
 fn ingest_test_class(
@@ -132,12 +143,16 @@ fn ingest_test_class(
     // A class on a base with no harness is left out whole by the app
     // ingest (`drop_unharnessed`): its body is not read, so a construct
     // in it cannot fail the ingest that only means to report it.
-    let left_out = |class: &str| TEST_CONCERNS.with(|c| c.borrow().unharnessed.iter().any(|u| u == class));
-    let unharnessed = left_out(name.0.as_str())
-        || parent.as_ref().is_some_and(|p| {
-            let base = p.0.as_str().trim_start_matches("::");
-            UNHARNESSED_TEST_BASES.contains(&base) || left_out(base)
-        });
+    // The base as written, with the `::` of a rooted `::BaseTest` kept
+    // for the lookup (the stored `parent` drops it).
+    let written = class.superclass().and_then(|n| {
+        let rooted = n.as_constant_path_node().is_some_and(|p| super::util::constant_path_is_rooted(&p));
+        parent.as_ref().map(|p| if rooted { format!("::{}", p.0) } else { p.0.to_string() })
+    });
+    let unharnessed_base = TEST_CONCERNS.with(|c| {
+        unharnessed_class(scope, name.0.as_str(), written.as_deref(), &c.borrow().unharnessed)
+    });
+    let unharnessed = unharnessed_base.is_some();
     // Concerns `test_helper.rb` mixes into `ActiveSupport::TestCase`: a
     // class that derives from a framework base inherits their `included`
     // registrations ahead of its own, as a parent's callbacks run first.
@@ -334,6 +349,7 @@ fn ingest_test_class(
         helpers,
         constants,
         includes,
+        unharnessed: unharnessed_base.map(|b| ClassId(Symbol::from(b.as_str()))),
     })
 }
 
@@ -871,6 +887,31 @@ pub(crate) const UNHARNESSED_TEST_BASES: [&str; 4] = [
     "ActionDispatch::SystemTestCase",
 ];
 
+/// The base test class `name` (on `parent` as written, inside the modules
+/// `scope`) is left out for, or `name` itself when it is in `left_out`
+/// already (a reopen): a framework base in [`UNHARNESSED_TEST_BASES`], or
+/// a class in `left_out`. A parent written relative to the enclosing
+/// modules (`Base` inside `module Mailers`) is looked up innermost module
+/// first, approximately as Ruby does: only against the left-out names,
+/// so a harnessed inner class does not shadow a left-out outer one.
+fn unharnessed_class(scope: &[String], name: &str, parent: Option<&str>, left_out: &[String]) -> Option<String> {
+    let is_left_out = |class: &str| left_out.iter().any(|u| u == class);
+    if is_left_out(name) {
+        return Some(name.to_string());
+    }
+    let parent = parent?;
+    if let Some(rooted) = parent.strip_prefix("::") {
+        return (UNHARNESSED_TEST_BASES.contains(&rooted) || is_left_out(rooted)).then(|| rooted.to_string());
+    }
+    for depth in (0..=scope.len()).rev() {
+        let candidate = scope[..depth].iter().map(String::as_str).chain([parent]).collect::<Vec<_>>().join("::");
+        if is_left_out(&candidate) {
+            return Some(candidate);
+        }
+    }
+    UNHARNESSED_TEST_BASES.contains(&parent).then(|| parent.to_string())
+}
+
 /// A framework test case: one `ActiveSupport::TestCase` is, or derives
 /// from, so a Concern included into it reaches the class.
 fn is_framework_test_base(parent: &str) -> bool {
@@ -1392,8 +1433,10 @@ fn ingest_test_loop(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Vec<Test
             let Some(test) = s.as_call_node().filter(|c| declares_test(s) && c.arguments().is_some()) else {
                 return Err(refuse("its block holds more than `test` declarations"));
             };
-            let Some(name_node) = test.arguments().and_then(|a| a.arguments().iter().next()) else {
-                return Err(refuse("a test has no name"));
+            // Only the name: Ruby would evaluate any further argument.
+            let args: Vec<Node<'_>> = test.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let [name_node] = args.as_slice() else {
+                return Err(refuse("a test takes other than one name argument"));
             };
             let name = test_name(&name_node, &param_refs, row, text).ok_or_else(|| refuse("a test name is not a string the loop's parameters complete"))?;
             // A blockless `test` is Rails' `flunk`; a forwarded block
@@ -1756,6 +1799,7 @@ end
             ("{ \"x\" => 1, \"x\" => 2 }.each do |k, v|\n    test \"#{k} #{v}\" do\n    end\n  end", "repeats a key"),
             ("[:test_generated].each do |m|\n    define_method(m) do\n    end\n  end", "holds more than `test` declarations"),
             ("%w[YouTube youtube].each do |n|\n    test n do\n    end\n  end", "would both be emitted as `test_youtube`"),
+            ("[1].each do |n|\n    test \"#{n}\", (raise \"bad\") do\n    end\n  end", "other than one name argument"),
             // One Ruby method; then two Ruby methods the emit names alike.
             ("def test_a__b\n  end\n  test \"a__b\" do\n  end", "`test_a__b` is declared twice"),
             ("def test_a__b\n  end\n  test \"a b\" do\n  end", "would both be emitted as `test_a_b`"),
