@@ -1744,7 +1744,7 @@ fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String], cruby: bool) -
         // 17 and a Linux runner's to 15, for the same emit), and
         // counting it passed claims a check that never ran. So it is
         // reported on its own line and taken out of BOTH sides of the
-        // tally by `scripts/campfire-suite`.
+        // tally by `scripts/app-suite`.
         // One `rescue Exception`. `TestSkipped < Exception`, and a
         // framework file never loads the helper that defines that
         // class — naming it in its own rescue arm raised
@@ -1849,7 +1849,7 @@ fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String], cruby: bool) -
 /// Written only for `cruby`: spinel AOT compiles this same shim text,
 /// has no `Exception#backtrace`, and its tree stays byte-identical.
 /// `Dir.pwd` is the emit root in every lane that runs these files —
-/// `scripts/campfire-suite` cds into the tree first. Indentation is
+/// `scripts/app-suite` cds into the tree first. Indentation is
 /// the shim's 4-space one: both call sites are a rescue arm.
 fn write_failure_origin(s: &mut String) {
     // `?` for a nil or empty backtrace: an exception built but never

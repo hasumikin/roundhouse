@@ -3,5 +3,6 @@
   "repo": "basecamp/once-campfire",
   "src": "~/git/once-campfire",
   "framework": "minitest",
+  "stubs": true,
   "rails_extra_gems": ["benchmark"]
 }

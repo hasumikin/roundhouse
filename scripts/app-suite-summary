@@ -1,20 +1,20 @@
 #!/usr/bin/env ruby
-# scripts/campfire-suite-summary — turn a scripts/campfire-suite run into
-# the machine-readable report the published page is rendered from.
+# scripts/app-suite-summary — turn a scripts/app-suite run into the
+# machine-readable report the published page is rendered from.
 #
-# The campfire twin of the JSON half of scripts/lobsters-specs. That
-# script runs the suite and writes its own summary.json because it is
-# Ruby all the way down; campfire-suite is bash, so the clustering lives
-# here and `campfire-suite --json` calls it.
+# The sibling of the JSON half of scripts/lobsters-specs. That script
+# runs the suite and writes its own summary.json because it is Ruby all
+# the way down; app-suite is bash, so the clustering lives here and
+# `app-suite --json` calls it.
 #
 # SEPARATE SCRIPT, NOT INLINE, for one reason beyond tidiness: triage
-# iterates. Editing bench/campfire/suite-causes.json and re-running this
-# against a SAVED tally re-clusters 240 tests in a second, where re-running
-# the suite costs a cargo build and four minutes. The tally is the run;
-# this is a pure function of it.
+# iterates. Editing bench/<app>/suite-causes.json and re-running this
+# against a SAVED tally re-clusters a few hundred tests in a second, where
+# re-running the suite costs a cargo build and four minutes. The tally is
+# the run; this is a pure function of it.
 #
-# WHAT A "FAILURE" IS HERE. campfire's suite is Minitest run by the
-# emitted autorun shim, which reports per-test `FAIL <Class>#<test>: <msg>`
+# WHAT A "FAILURE" IS HERE. The app's suite is Minitest run by the emitted
+# autorun shim, which reports per-test `FAIL <Class>#<test>: <msg>`
 # lines — but only for files that LOAD. A file that dies at require time
 # contributes its whole test count with no per-test message at all, and
 # those are exactly the interesting ones. So the unit is an UNPASSED TEST
@@ -24,7 +24,7 @@
 # they are not a count of FAIL lines.
 #
 # Usage:
-#   scripts/campfire-suite-summary --tally FILE [options]
+#   scripts/app-suite-summary --tally FILE [options]
 #
 #   --tally FILE      the `STATUS|file|passed|total|first-error` table
 #                     (required — it is the run)
@@ -33,8 +33,10 @@
 #                     that file's first error, which over-credits the
 #                     first wall; the JSON records which was used.
 #   --emit-log FILE   the transpile's stderr, for the diagnostic counts
-#   --app DIR         the campfire checkout, for its SHA
-#   --campfire-sha S  state the SHA directly (CI pins it and never clones
+#   --app NAME        recipe bench/NAME/app.json (default campfire); it
+#                     names the app and the causes file
+#   --app-path DIR    the app checkout, for its SHA
+#   --app-sha S       state the SHA directly (CI pins it and never clones
 #                     a git tree — the tarball has no .git)
 #   --target T        which lane produced the tally, `ruby` (default) or
 #                     `spinel`. The page must say: the two lanes run the
@@ -45,21 +47,21 @@
 #                     own `--version` — it is the one input to that lane
 #                     nobody here controls.
 #   --stubs FILE      the spliced ledger when present (default path
-#                     scripts/campfire-walk-stubs.rb; tip has none)
+#                     scripts/<app>-walk-stubs.rb; tip has none)
 #   --no-stubs        the run spliced nothing
-#   --out PATH        where to write (default build/campfire-suite/summary.json)
+#   --out PATH        where to write (default build/app-suite/summary.json)
 
 require "json"
 require "time"
 require "open3"
 
 ROOT = File.expand_path("..", __dir__)
-CAUSES_FILE = File.join(ROOT, "bench", "campfire", "suite-causes.json")
 
 opts = {
-  tally: nil, fail_log: nil, emit_log: nil, app: nil, sha: nil, target: "ruby",
-  stubs: File.join(ROOT, "scripts", "campfire-walk-stubs.rb"),
-  out: File.join(ROOT, "build", "campfire-suite", "summary.json"),
+  tally: nil, fail_log: nil, emit_log: nil,
+  app: "campfire", app_path: nil, sha: nil, target: "ruby",
+  stubs: :default,
+  out: File.join(ROOT, "build", "app-suite", "summary.json"),
 }
 args = ARGV.dup
 until args.empty?
@@ -68,19 +70,25 @@ until args.empty?
   when "--fail-log"     then opts[:fail_log] = args.shift
   when "--emit-log"     then opts[:emit_log] = args.shift
   when "--app"          then opts[:app] = args.shift
-  when "--campfire-sha" then opts[:sha] = args.shift
+  when "--app-path"     then opts[:app_path] = args.shift
+  when "--app-sha"      then opts[:sha] = args.shift
   when "--target"       then opts[:target] = args.shift
   when "--stubs"        then opts[:stubs] = args.shift
-  when "--no-stubs"     then opts[:stubs] = nil
+  when "--no-stubs"     then opts[:stubs] = false
   when "--out"          then opts[:out] = args.shift
   when "-h", "--help"
     puts File.readlines(__FILE__).drop(1).take_while { |l| l.start_with?("#") }.map { |l| l.sub(/^# ?/, "") }
     exit 0
-  else abort "campfire-suite-summary: unknown argument #{a}"
+  else abort "app-suite-summary: unknown argument #{a}"
   end
 end
-abort "campfire-suite-summary: --tally is required" unless opts[:tally]
-abort "campfire-suite-summary: no tally at #{opts[:tally]}" unless File.exist?(opts[:tally])
+abort "app-suite-summary: --tally is required" unless opts[:tally]
+abort "app-suite-summary: no tally at #{opts[:tally]}" unless File.exist?(opts[:tally])
+
+RECIPE = File.join(ROOT, "bench", opts[:app], "app.json")
+recipe = File.exist?(RECIPE) ? (JSON.parse(File.read(RECIPE)) rescue {}) : {}
+CAUSES_FILE = File.join(ROOT, "bench", opts[:app], "suite-causes.json")
+opts[:stubs] = File.join(ROOT, "scripts", "#{opts[:app]}-walk-stubs.rb") if opts[:stubs] == :default
 
 def git(dir, *a)
   out, _, st = Open3.capture3("git", "-C", dir, *a)
@@ -117,7 +125,7 @@ by_file = read_lines_scrubbed(opts[:tally]).filter_map do |line|
     # by the renderer, which should not have to re-derive it.
     "first_error" => why.to_s.strip }
 end
-abort "campfire-suite-summary: tally at #{opts[:tally]} has no rows" if by_file.empty?
+abort "app-suite-summary: tally at #{opts[:tally]} has no rows" if by_file.empty?
 
 # ── Per-test failures ────────────────────────────────────────────────
 fails_by_file = Hash.new { |h, k| h[k] = [] }
@@ -203,7 +211,7 @@ if unclassified.any?
     "slug" => "unclassified", "title" => "Not yet triaged", "owner" => "unknown",
     "failures" => weigh.(unclassified),
     "share" => (weigh.(unclassified).to_f / unpassed_total).round(4),
-    "note" => "No rule in bench/campfire/suite-causes.json matches these. Triage, then add a rule.",
+    "note" => "No rule in bench/#{opts[:app]}/suite-causes.json matches these. Triage, then add a rule.",
     "stale_rule" => false,
     "examples" => sample.(unclassified, 12),
   }
@@ -225,7 +233,7 @@ end
 # Every entry is something the emit could not do for itself, spliced in
 # before the count was taken. A pass rate propped up by the harness is
 # not a pass rate about the emit, so the page lists them.
-stubs = { "spliced" => !opts[:stubs].nil? }
+stubs = { "spliced" => !!opts[:stubs] }
 if opts[:stubs] && File.exist?(opts[:stubs])
   stubs["file"] = opts[:stubs].sub("#{ROOT}/", "")
   blocks = []
@@ -280,9 +288,9 @@ if opts[:stubs] && File.exist?(opts[:stubs])
 end
 
 # ── Provenance ───────────────────────────────────────────────────────
-campfire = { "repo" => "basecamp/once-campfire", "pinned" => true }
-campfire["path"] = opts[:app] if opts[:app]
-campfire["sha"] = opts[:sha] || (opts[:app] && git(opts[:app], "rev-parse", "HEAD"))
+app = { "name" => opts[:app], "repo" => recipe["repo"], "pinned" => true }
+app["path"] = opts[:app_path] if opts[:app_path]
+app["sha"] = opts[:sha] || (opts[:app_path] && git(opts[:app_path], "rev-parse", "HEAD"))
 rh = {
   "sha" => git(ROOT, "rev-parse", "HEAD"),
   "dirty" => !git(ROOT, "status", "--porcelain", "--untracked-files=no").to_s.empty?,
@@ -290,7 +298,7 @@ rh = {
 
 # ── The compiler, on the lane that has one ───────────────────────────
 # WITHOUT THIS A RED NIGHT CANNOT BE ATTRIBUTED. The other three inputs
-# are stable by construction — campfire is pinned, roundhouse is this
+# are stable by construction — the app is pinned, roundhouse is this
 # checkout, ruby is this interpreter — but the spinel lane's compiler is
 # whatever the publisher pulled and built that morning, and it moves
 # without anyone here touching it (b80f6302 -> fc866b04 -> aff3815f
@@ -339,7 +347,7 @@ end
 
 files_green = by_file.count { |f| f["status"] == "pass" }
 # The compiled lane runs the same emitted Ruby as the interpreted one, so
-# every difference between two summaries with the same campfire SHA is the
+# every difference between two summaries with the same app SHA is the
 # COMPILER's, not the app's. Only this lane has a `build` row.
 lane = {
   "target" => opts[:target],
@@ -350,7 +358,7 @@ lane = {
 out = {
   "generated_at" => Time.now.utc.iso8601,
   "lane" => lane,
-  "campfire" => campfire,
+  "app" => app,
   "roundhouse" => rh,
   "ruby" => { "version" => RUBY_VERSION },
   "spinel" => spinel,
@@ -379,9 +387,9 @@ out = {
     "unbuilt" => by_file.count { |f| f["status"] == "build" },
   },
   "scope" => {
-    "note" => "Every test file campfire's own suite declares, read from the emitted Makefile's " \
+    "note" => "Every test file the app's own suite declares, read from the emitted Makefile's " \
               "SPINEL_TESTS rather than restated here — a `find test -name '*_test.rb'` would " \
-              "also sweep in the scaffold's own tests, which are not campfire's.",
+              "also sweep in the scaffold's own tests, which are not the app's.",
   },
   "causes" => causes,
   "by_file" => by_file.sort_by { |f| [-f["failed"], f["file"]] },
@@ -390,7 +398,7 @@ out = {
 require "fileutils"
 FileUtils.mkdir_p(File.dirname(opts[:out]))
 File.write(opts[:out], JSON.pretty_generate(out))
-warn "campfire-suite-summary: wrote #{opts[:out]}"
+warn "app-suite-summary: wrote #{opts[:out]}"
 unbuilt = out["files"]["unbuilt"]
 warn "  #{out["tests"]["passed"]}/#{out["tests"]["total"]} tests · " \
      "#{files_green}/#{by_file.size} files green · " \

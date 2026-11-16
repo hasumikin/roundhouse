@@ -1609,7 +1609,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      # No setup-rust: strict-emit and campfire-suite use the shared debug binary.
+      # No setup-rust: strict-emit and app-suite use the shared debug binary.
       - uses: actions/download-artifact@v8
         with:
           name: roundhouse-debug-bin
@@ -1631,7 +1631,7 @@ jobs:
       # useragent arrives with that gem.
       # ruby-vips: an FFI binding, so libvips has to be installed too.
       # ffmpeg: the video previewer extracts a poster frame.
-      - &campfire-suite-apt
+      - &app-suite-apt
         name: Install libvips (ruby-vips binds it through FFI) and ffmpeg
         # libvips42 and ffmpeg are a slow apt install on a shared runner.
         timeout-minutes: 20
@@ -1641,12 +1641,12 @@ jobs:
       # concurrent-ruby, net-http-persistent, web-push: WebPush::Pool
       # loads them. concurrent-ruby is named even though sentry-ruby
       # also depends on it.
-      - &campfire-suite-gems
+      - &app-suite-gems
         name: Install the gems the emitted suite loads
         # rack: the ruby-family swap of runtime/rack_utils.rb requires it.
         run: gem install sqlite3 bcrypt nokogiri webmock mocha rqrcode ruby-vips sentry-ruby platform_agent concurrent-ruby net-http-persistent web-push rails-html-sanitizer rack --no-document
       - name: Verify the suite's bcrypt test configuration
-        run: ruby tests/campfire_suite_bcrypt.rb
+        run: ruby tests/app_suite_bcrypt.rb
       - name: Fetch once-campfire at the pinned SHA
         run: |
           set -euo pipefail
@@ -1689,11 +1689,15 @@ jobs:
           if [ "$errors" -lt "$CEILING_ERRORS" ]; then
             echo "::notice::ceiling is stale — lower CEILING_ERRORS to $errors"
           fi
-      # --json feeds the published page. --fail-log attributes each
-      # unpassed test to its own message, not the file's first error.
+      # --json feeds the published page, and adds the row join against
+      # Rails' own run (bench/campfire/rails-baseline.json). --fail-log
+      # attributes each unpassed test to its own message, not the file's
+      # first error. --sha is the pin: the tarball has no .git.
       - name: Run campfire's suite against the emit
         run: |
-          scripts/campfire-suite \
+          scripts/app-suite \
+            --app campfire \
+            --sha "$CAMPFIRE_SHA" \
             --tally /tmp/campfire-tally.txt \
             --fail-log /tmp/campfire-failures.txt \
             --json /tmp/campfire-suite/summary.json \
@@ -4168,7 +4172,7 @@ jobs:
           fi
       - name: Render compiled campfire conformance page
         if: steps.fetch-campfire-suite-spinel.outputs.compiled_data == 'present'
-        run: scripts/campfire-suite-report _site/bench/campfire-suite-spinel _site/bench/campfire-suite-spinel/index.html
+        run: scripts/app-suite-report _site/bench/campfire-suite-spinel _site/bench/campfire-suite-spinel/index.html
 
       # The per-target archives, for the e2e-<target> jobs to download and
       # boot — the exact bytes published to roundhouse-rb.dev.
@@ -4372,7 +4376,7 @@ jobs:
       - name: Render campfire conformance page
         run: |
           if [ -f _site/bench/campfire-suite/summary.json ]; then
-            scripts/campfire-suite-report _site/bench/campfire-suite _site/bench/campfire-suite/index.html
+            scripts/app-suite-report _site/bench/campfire-suite _site/bench/campfire-suite/index.html
           else
             echo "::warning::campfire conformance summary unavailable; skipping conformance page render"
             rm -rf _site/bench/campfire-suite
