@@ -48,6 +48,9 @@
 #                     join writes `rows`, `dropped`, `env` and `extra`;
 #                     without it those are null. Default
 #                     bench/<app>/rails-baseline.json when it exists.
+#   --no-join REASON  skip the join and record REASON (app-suite passes
+#                     it for --filter: a partial run against the whole
+#                     baseline would call every filtered-out test dropped).
 #   --emit-log FILE   the transpile's stderr, for the diagnostic counts
 #   --app NAME        recipe bench/NAME/app.json (default campfire); it
 #                     names the app and the causes file
@@ -86,6 +89,7 @@ until args.empty?
   when "--fail-log"     then opts[:fail_log] = args.shift
   when "--emit-tests"   then opts[:emit_tests] = args.shift
   when "--baseline"     then opts[:baseline] = args.shift
+  when "--no-join"      then opts[:no_join] = args.shift
   when "--emit-log"     then opts[:emit_log] = args.shift
   when "--app"          then opts[:app] = args.shift
   when "--app-path"     then opts[:app_path] = args.shift
@@ -193,8 +197,8 @@ if have_emit_tests
   read_lines_scrubbed(opts[:emit_tests]).each do |line|
     line = line.chomp
     next if line.empty?
-    name, status = line.split("|", 2)
-    emit_rows[row_key.(name)] = { "name" => name, "status" => status.to_s }
+    name, status, file = line.split("|", 3)
+    emit_rows[row_key.(name)] = { "name" => name, "status" => status.to_s, "file" => file }
   end
 end
 
@@ -204,7 +208,9 @@ env = []
 extra = []
 env_keys = {}
 baseline_meta = nil
-if opts[:baseline].nil?
+if opts[:no_join]
+  baseline_meta = { "note" => "Not joined: #{opts[:no_join]}" }
+elsif opts[:baseline].nil?
   baseline_meta = {
     "note" => "No Rails baseline at bench/#{opts[:app]}/rails-baseline.json; the row join did not run.",
   }
@@ -282,7 +288,13 @@ by_file.each do |f|
     records << { "file" => f["file"], "test" => t["test"], "msg" => t["msg"],
                  "exception" => t["exception"], "frame" => t["frame"], "weight" => 1 }
   end
-  short = unpassed - [listed.size, unpassed].min
+  # The shortfall is the tests that never printed a line of their own;
+  # the ones Rails fails too are set aside here as well.
+  listed_keys = listed.map { |t| row_key.(t["test"]) }
+  env_unlisted = emit_rows.count do |k, r|
+    r["file"] == f["file"] && env_keys[k] && !listed_keys.include?(k)
+  end
+  short = unpassed - [listed.size, unpassed].min - env_unlisted
   next if short <= 0
   f["aborted"] = listed.empty?
   records << { "file" => f["file"],

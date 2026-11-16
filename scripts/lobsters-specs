@@ -394,10 +394,13 @@ if opts[:rails]
   rcmd << opts[:src]
   log.("recording Rails' own run of #{opts[:suites].join(", ")} → #{baseline_path}")
   _, rerr_b, rst_b = sh(rcmd, chdir: ROOT)
-  unless rst_b.success?
-    abort "lobsters-specs: Rails' own run failed (exit #{rst_b.exitstatus})\n#{rerr_b.lines.last(20).join}"
-  end
-  baseline = JSON.parse(File.read(baseline_path))
+  # A Rails run that fails costs the join, not the emit's report.
+  baseline = rst_b.success? ? JSON.parse(File.read(baseline_path)) : nil
+end
+if opts[:rails] && baseline.nil?
+  baseline_meta = { "note" => "Not joined: Rails' own run failed (exit #{rst_b.exitstatus})." }
+  log.("#{baseline_meta["note"]}\n#{rerr_b.lines.last(20).join}")
+elsif opts[:rails]
   short = ->(s) { s.to_s.empty? ? "an unknown commit" : s.to_s[0, 12] }
   baseline_meta = {
     "file" => File.basename(baseline_path),

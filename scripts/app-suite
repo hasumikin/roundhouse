@@ -573,7 +573,7 @@ ruby_slot=0
 emit_test_rows() { # path out complete
     [[ -n "$EMIT_TESTS" ]] || return 0
     printf '%s\n' "$2" | ruby -e '
-      path, complete = ARGV
+      path, complete, file = ARGV
       ids = []
       File.read(path).scan(/"FAIL ([A-Za-z0-9_:]+)#([^":]*): "/) { |k, t| ids << "#{k}##{t}" }
       seen = {}
@@ -586,9 +586,9 @@ emit_test_rows() { # path out complete
       end
       ids.uniq.each do |id|
         status = seen[id] || (complete == "1" ? "pass" : "fail")
-        puts "#{id}|#{status}"
+        puts "#{id}|#{status}|#{file}"
       end
-    ' "$1" "$3" >> "$EMIT_TESTS"
+    ' "$1" "$3" "${1%.rb}" >> "$EMIT_TESTS"
 }
 
 for t in "${TESTS[@]}"; do
@@ -670,9 +670,11 @@ for t in "${TESTS[@]}"; do
                 msg = msg.to_s[0, 200]
                 exc = ""
                 frame = ""
-                nxt = lines[i + 1].to_s
-                if nxt.start_with?("  at ")
-                  exc, frame = nxt.delete_prefix("  at ").split(" ", 2)
+                # A message may span lines; its `  at` line follows the
+                # last of them, before the next FAIL or SKIP.
+                at = lines[(i + 1)..].find { |l| l.start_with?("  at ", "FAIL ", "SKIP ") }
+                if at&.start_with?("  at ")
+                  exc, frame = at.delete_prefix("  at ").split(" ", 2)
                 end
                 puts [file, id, msg, exc, frame].join("|")
               end
@@ -711,6 +713,9 @@ if [[ -n "$JSON" ]]; then
         summary_args+=(--app-sha "$SHA")
     elif [[ -n "$APP" ]]; then
         summary_args+=(--app-path "$APP")
+    fi
+    if [[ -n "$FILTER" ]]; then
+        summary_args+=(--no-join "--filter ran only the files matching $FILTER")
     fi
     if (( STUBS )); then
         [[ -f "$STUBS_FILE" ]] && summary_args+=(--stubs "$STUBS_FILE")

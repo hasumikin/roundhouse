@@ -79,6 +79,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
             "build-roundhouse",
             "campfire-conformance",
             "campfire-compare",
+            "writebook-conformance",
         ] {
             assert!(
                 needs.iter().any(|v| v.as_str() == Some(required)),
