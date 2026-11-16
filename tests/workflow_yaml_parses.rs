@@ -422,6 +422,14 @@ fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
             "Install libvips (ruby-vips binds it through FFI) and ffmpeg",
             "libvips42 ffmpeg",
         ),
+        // The shared app-suite apt step: both pinned apps' Rails boots (and
+        // their emitted ruby-vips processors) need libvips from the same
+        // cache key, so the second lane reuses the first's step.
+        (
+            "writebook-conformance",
+            "Install libvips (ruby-vips binds it through FFI) and ffmpeg",
+            "libvips42 ffmpeg",
+        ),
     ] {
         let step = workflow["jobs"][job_name]["steps"]
             .as_sequence()
