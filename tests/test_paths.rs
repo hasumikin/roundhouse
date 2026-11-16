@@ -68,8 +68,10 @@ fn default_and_custom_tests() -> Vec<(PathBuf, String)> {
             "ChannelDefaultTest",
         ),
         ruby_file("test/lib/lib_default_test.rb", "LibDefaultTest"),
-        ruby_file("test/unit/unit_custom_test.rb", "UnitCustomTest"),
-        ruby_file("test/utils/utils_custom_test.rb", "UtilsCustomTest"),
+        // Not `*_test.rb`: Rails' default glob does not run them, so only
+        // a configured root reads them.
+        ruby_file("test/unit/unit_custom.rb", "UnitCustomTest"),
+        ruby_file("test/utils/utils_custom.rb", "UtilsCustomTest"),
     ]
 }
 
@@ -96,6 +98,39 @@ const ALL_STANDARD_MODULES: &[&str] = &[
 fn rails_test_roots_include_test_lib_by_default() {
     let app = ingest_files(default_and_custom_tests()).expect("ingest tree");
     assert_modules(&app, DEFAULT_MODULES);
+}
+
+/// What `bin/rails test` runs with no arguments: `test/**/*_test.rb`,
+/// less `test/{system,dummy,fixtures}`. Before this, a test under
+/// `test/integration` or an app's own folder was dropped silently.
+#[test]
+fn rails_default_glob_reaches_every_test_folder() {
+    let mut files = default_and_custom_tests();
+    files.extend([
+        ruby_file("test/integration/flow_test.rb", "FlowTest"),
+        ruby_file("test/middleware/guard_test.rb", "GuardTest"),
+        ruby_file("test/script/admin/reset_test.rb", "ResetTest"),
+        ruby_file("test/top_level_test.rb", "TopLevelTest"),
+        // Not run by Rails' default glob.
+        ruby_file("test/integration/not_a_test_file.rb", "NotATestFileTest"),
+        ruby_file("test/system/browser_test.rb", "BrowserTest"),
+        ruby_file("test/dummy/test/dummy_test.rb", "DummyTest"),
+        ruby_file("test/fixtures/files/fixture_test.rb", "FixtureTest"),
+        // Read, but its base has no harness: reported, not emitted.
+        text_file(
+            "test/mailers/notice_mailer_test.rb",
+            "class NoticeMailerTest < ActionMailer::TestCase\n  test \"sends\" do\n  end\nend\n",
+        ),
+    ]);
+    let app = ingest_files(files).expect("ingest tree");
+    let mut expected = DEFAULT_MODULES.to_vec();
+    expected.extend(["FlowTest", "GuardTest", "ResetTest", "TopLevelTest"]);
+    assert_modules(&app, &expected);
+    let drops: Vec<&str> = app.test_drops.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(
+        drops,
+        ["`NoticeMailerTest < ActionMailer::TestCase`: the runtime has no ActionMailer::TestCase harness, so its tests are not emitted"]
+    );
 }
 
 #[test]

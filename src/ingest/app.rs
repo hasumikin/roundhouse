@@ -2561,23 +2561,15 @@ end
     // the mixin means, and it needs nothing from a target's mixin
     // semantics.
     let shared_test_helpers = ingest_test_helper_modules(vfs, dir)?;
-    // Test files under the Rails defaults and the additional roots from
-    // `roundhouse.yml`. Select every Ruby file recursively.
-    let mut test_roots: Vec<PathBuf> = [
-        "test/models",
-        "test/controllers",
-        "test/helpers",
-        "test/channels",
-        "test/lib",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect();
+    // Test files: every Ruby file under the default roots and the
+    // additional roots from `roundhouse.yml`, plus every file Rails'
+    // own default glob runs (`test/integration/*_test.rb`, …).
+    let mut test_roots: Vec<PathBuf> = DEFAULT_TEST_ROOTS.into_iter().map(PathBuf::from).collect();
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();
 
-    let mut test_files = Vec::new();
+    let mut test_files = rails_default_test_files(vfs, dir)?;
     for root in test_roots {
         let tests_dir = dir.join(root);
         if !path_has_symlink_component(vfs, dir, &tests_dir) && vfs.is_dir(&tests_dir) {
@@ -2692,6 +2684,16 @@ end
         });
         if let Some(tms) = unwrap_or_record(ingested)? {
             for mut tm in tms {
+                if let Some(base) = tm.parent.as_ref().filter(|p| UNHARNESSED_TEST_BASES.contains(&p.0.as_str())) {
+                    app.test_drops.push(crate::app::IngestDrop {
+                        span: crate::span::Span { file: super::sources::file_id(&entry.display().to_string()), start: 0, end: 0 },
+                        message: format!(
+                            "`{} < {}`: the runtime has no {} harness, so its tests are not emitted",
+                            tm.name.0, base.0, base.0
+                        ),
+                    });
+                    continue;
+                }
                 // A module every test case already includes, included
                 // again: a no-op in Ruby, and spliced rather than
                 // carried here, so the `include` would name nothing.
@@ -9869,6 +9871,48 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
     Ok(files)
 }
 
+/// Framework test-case bases the emitted test harness does not define
+/// (`runtime/spinel/test/test_helper.rb` has `ActiveSupport::TestCase`'s,
+/// the integration, controller, view and cable ones). A test class on one
+/// is reported and left out rather than emitted to fail at load.
+const UNHARNESSED_TEST_BASES: [&str; 4] = [
+    "ActionMailer::TestCase",
+    "ActiveJob::TestCase",
+    "ActionMailbox::TestCase",
+    "ActionDispatch::SystemTestCase",
+];
+
+/// The folders whose `.rb` files are all read as tests, beside the
+/// Rails default glob ([`rails_default_test_files`]).
+const DEFAULT_TEST_ROOTS: [&str; 5] =
+    ["test/models", "test/controllers", "test/helpers", "test/channels", "test/lib"];
+
+/// The files `bin/rails test` runs with no arguments: Rails'
+/// `test/**/*_test.rb`, less `test/{system,dummy,fixtures}`
+/// (`Rails::TestUnit::Runner.default_test_exclude_glob`). This is what
+/// reaches `test/integration`, `test/mailers`, `test/middleware` and an
+/// app's own folders, which Rails runs as tests too.
+fn rails_default_test_files<V: Vfs + ?Sized>(vfs: &V, app_root: &Path) -> IngestResult<Vec<PathBuf>> {
+    let test_dir = app_root.join("test");
+    if path_has_symlink_component(vfs, app_root, &test_dir) || !vfs.is_dir(&test_dir) {
+        return Ok(Vec::new());
+    }
+    let excluded = ["system", "dummy", "fixtures"].map(|d| test_dir.join(d));
+    let mut files = Vec::new();
+    for entry in vfs.read_dir(&test_dir)? {
+        if excluded.contains(&entry) || path_has_symlink_component(vfs, app_root, &entry) {
+            continue;
+        }
+        if vfs.is_dir(&entry) {
+            files.extend(read_test_rb_files(vfs, app_root, &entry)?);
+        } else {
+            files.push(entry);
+        }
+    }
+    files.retain(|f| f.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("_test.rb")));
+    Ok(files)
+}
+
 /// The app's `roundhouse.yml`. An absent file is the default configuration.
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -10698,18 +10742,12 @@ fn route_helper_sources<V: Vfs + ?Sized>(
             }
         }
     }
-    let mut test_roots: Vec<PathBuf> = [
-        "test/models",
-        "test/controllers",
-        "test/helpers",
-        "test/channels",
-        "test/lib",
-        "test/test_helpers",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect();
+    let mut test_roots: Vec<PathBuf> =
+        DEFAULT_TEST_ROOTS.into_iter().chain(["test/test_helpers"]).map(PathBuf::from).collect();
     test_roots.extend(additional_test_paths.iter().cloned());
+    if let Ok(files) = rails_default_test_files(vfs, dir) {
+        rb_files.extend(files);
+    }
     test_roots.sort();
     test_roots.dedup();
     for test_root in test_roots {
