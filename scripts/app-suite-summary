@@ -230,7 +230,10 @@ else
   # A checkout with uncommitted changes is not the tree its HEAD names.
   dirty = !opts[:sha] && opts[:app_path] && !git(opts[:app_path], "status", "--porcelain").to_s.empty?
   short = ->(s) { s.to_s.empty? ? "an unknown commit" : s.to_s[0, 12] }
-  if dirty
+  if baseline["dirty"]
+    baseline_meta["note"] = "Not joined: the baseline was recorded from a checkout with uncommitted changes."
+    warn "app-suite-summary: the baseline was recorded from a dirty checkout; writing rows: null"
+  elsif dirty
     baseline_meta["note"] = "Not joined: the app checkout has uncommitted changes, so this run is not #{short.(run_sha)}."
     warn "app-suite-summary: #{opts[:app_path]} has uncommitted changes; writing rows: null"
   elsif baseline["sha"].to_s.empty? || run_sha.to_s.empty? || baseline["sha"] != run_sha

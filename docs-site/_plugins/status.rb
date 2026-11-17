@@ -148,8 +148,10 @@ module RoundhouseStatus
         "consistent" => problems.empty?, "problems" => problems,
         "causes" => causes, "by_file" => by_file, "harness_compensations" => compensations,
         "warnings" => { "total" => s.dig("emit", "warnings"), "by_kind" => s.dig("emit", "by_kind").to_h },
-        # Same app revision, Ruby, spec selection and harness: results under one key compare.
-        "scope_key" => digest(s.dig("lobsters", "sha"), s.dig("ruby", "pinned"), s["scope"], by_file.map { |f| [f["file"], f["examples"]] }.sort, compensations)
+        # Same app revision, Ruby, spec selection, harness and Rails join (whether it ran, and which
+        # failures it set aside): results under one key compare.
+        "scope_key" => digest(s.dig("lobsters", "sha"), s.dig("ruby", "pinned"), s["scope"], by_file.map { |f| [f["file"], f["examples"]] }.sort, compensations,
+                              s["rows"].nil?, s["env"].to_a.map { |e| e["id"] }.sort)
       }
     }
   end

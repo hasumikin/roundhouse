@@ -414,7 +414,10 @@ elsif opts[:rails]
     "ruby" => baseline["ruby"], "suites" => baseline["suites"],
     "generated_at" => baseline["generated_at"],
   }
-  if emit_sha.to_s.empty? || emit_sha != lob["sha"].to_s
+  if baseline["dirty"]
+    baseline_meta["note"] = "Not joined: Rails' run was recorded from a checkout with uncommitted changes."
+    log.(baseline_meta["note"])
+  elsif emit_sha.to_s.empty? || emit_sha != lob["sha"].to_s
     # A reused tree with no record, or one built from another commit, did
     # not run the code the baseline ran.
     baseline_meta["note"] = "Not joined: the emit tree was built from #{short.(emit_sha)}, " \

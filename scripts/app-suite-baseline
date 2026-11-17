@@ -99,6 +99,13 @@ sha = opts[:sha] || begin
   o, st = Open3.capture2("git", "-C", src, "rev-parse", "HEAD")
   st.success? ? o.strip : nil
 end
+# The copy below is the tree on disk, so uncommitted changes would run
+# under HEAD's SHA. Recorded; the joins refuse a dirty baseline.
+dirty = if opts[:sha] then false
+        else
+          o, st = Open3.capture2("git", "-C", src, "status", "--porcelain")
+          st.success? && !o.strip.empty?
+        end
 pinned_ruby = File.read(File.join(src, ".ruby-version")).strip rescue nil
 
 work = Dir.mktmpdir("app-suite-baseline-")
@@ -176,6 +183,7 @@ baseline = {
   "app" => opts[:app],
   "repo" => recipe["repo"],
   "sha" => sha,
+  "dirty" => dirty,
   "framework" => framework,
   "rails" => File.read(File.join(copy, "Gemfile.lock"))[/^    rails \(([^)]+)\)/, 1],
   "ruby" => { "used" => RUBY_VERSION, "pinned" => pinned_ruby },
