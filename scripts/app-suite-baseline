@@ -142,6 +142,16 @@ log, status = Open3.capture2e(env.merge("RUBYLIB" => [PLUGIN_DIR, ENV["RUBYLIB"]
                               *command, chdir: copy)
 File.write(File.join(work, "suite.log"), log)
 abort "app-suite-baseline: the suite wrote no rows (see #{work}/suite.log)\n#{log.lines.last(20).join}" unless File.exist?(rows_file)
+if framework == "rspec"
+  # A spec file that fails to load contributes no examples, so its tests
+  # would leave the baseline silently. Failing examples are fine (they are
+  # the join's env rows), and so is an error in an after(:context) hook.
+  load_errors = JSON.parse(File.read(rows_file))["messages"].to_a.grep(/An error occurred while loading/)
+  unless load_errors.empty?
+    abort "app-suite-baseline: #{load_errors.size} spec file(s) failed to load on Rails, so the baseline " \
+          "would be missing their examples:\n#{load_errors.first.to_s.lines.first(4).join}"
+  end
+end
 
 rows =
   if framework == "rspec"

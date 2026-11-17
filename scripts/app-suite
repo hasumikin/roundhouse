@@ -224,6 +224,9 @@ TALLY="$(abs_path "$TALLY")"
 FAIL_LOG="$(abs_path "$FAIL_LOG")"
 JSON="$(abs_path "$JSON")"
 EMIT_TESTS="$(abs_path "$EMIT_TESTS")"
+# This run's rows only: each file appends below, and a stale row left from
+# an earlier run would answer for a test this emit no longer generates.
+: > "$EMIT_TESTS"
 
 case "$TARGET" in
     ruby)   ;;
@@ -641,8 +644,15 @@ for t in "${TESTS[@]}"; do
         # `head -1`'s early exit into a SIGPIPE failure for the
         # upstream grep, which `set -e` then treats as fatal — it ends
         # the run mid-suite with a partial tally and no summary.
-        nf=$(printf '%s\n' "$out" |
-             sed -nE 's/.*: ([0-9]+) of [0-9]+ tests failed.*/\1/p' | head -1 || true)
+        # THIS file's driver summary, by its class: a test file that
+        # requires another one which fails prints that file's summary
+        # too, and it must not read as this file having finished.
+        cls=$(sed -nE 's/^  raise "([A-Za-z0-9_:]+): " \+ __failed.*/\1/p' "$t.rb" | head -1 || true)
+        nf=""
+        if [[ -n "$cls" ]]; then
+            nf=$(printf '%s\n' "$out" |
+                 sed -nE "s/(^|.*[^A-Za-z0-9_:])${cls}: ([0-9]+) of [0-9]+ tests failed.*/\2/p" | head -1 || true)
+        fi
         take_skips_out "$out"
         if [[ -n "$nf" ]]; then
             ok=$((n - nf))

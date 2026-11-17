@@ -227,8 +227,13 @@ else
     "ruby" => baseline["ruby"], "generated_at" => baseline["generated_at"],
   }
   run_sha = opts[:sha] || (opts[:app_path] && git(opts[:app_path], "rev-parse", "HEAD"))
+  # A checkout with uncommitted changes is not the tree its HEAD names.
+  dirty = !opts[:sha] && opts[:app_path] && !git(opts[:app_path], "status", "--porcelain").to_s.empty?
   short = ->(s) { s.to_s.empty? ? "an unknown commit" : s.to_s[0, 12] }
-  if baseline["sha"].to_s.empty? || run_sha.to_s.empty? || baseline["sha"] != run_sha
+  if dirty
+    baseline_meta["note"] = "Not joined: the app checkout has uncommitted changes, so this run is not #{short.(run_sha)}."
+    warn "app-suite-summary: #{opts[:app_path]} has uncommitted changes; writing rows: null"
+  elsif baseline["sha"].to_s.empty? || run_sha.to_s.empty? || baseline["sha"] != run_sha
     # A join across two commits is a fabricated number: tests move, and
     # the answer would describe neither the baseline nor this emit.
     baseline_meta["note"] = "Not joined: the baseline is Rails' run at #{short.(baseline["sha"])}, " \
@@ -291,8 +296,9 @@ by_file.each do |f|
   # The shortfall is the tests that never printed a line of their own;
   # the ones Rails fails too are set aside here as well.
   listed_keys = listed.map { |t| row_key.(t["test"]) }
+  # Only an env test that the emit also failed is in `unpassed`.
   env_unlisted = emit_rows.count do |k, r|
-    r["file"] == f["file"] && env_keys[k] && !listed_keys.include?(k)
+    r["file"] == f["file"] && env_keys[k] && r["status"] == "fail" && !listed_keys.include?(k)
   end
   short = unpassed - [listed.size, unpassed].min - env_unlisted
   next if short <= 0

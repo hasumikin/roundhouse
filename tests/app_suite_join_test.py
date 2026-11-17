@@ -132,6 +132,41 @@ class AppSuiteJoinTests(unittest.TestCase):
         self.assertIn("Set aside: fails on Rails too", html)
         self.assertIn("of 4 tests Rails runs", html)
 
+    def test_env_failures_the_emit_also_fails_are_set_aside_but_compiler_ones_stay(self):
+        # One file, three tests failing on the emit: an env test with its own
+        # FAIL line, and an env test and a compiler failure with none (the
+        # shortfall). A fourth env test passes on the emit and must not
+        # shrink the shortfall: only the compiler failure is charged.
+        write(self.dir / "tally.txt", "FAIL|test/beta_test|1|4|boom\n")
+        write(
+            self.dir / "fail.txt",
+            "test/beta_test|BetaTest#test_env_listed|heif|LoadError|app/v.rb:1:in 'v'\n",
+        )
+        write(
+            self.dir / "emit.txt",
+            "BetaTest#test_env_listed|fail|test/beta_test\n"
+            "BetaTest#test_env_unlisted|fail|test/beta_test\n"
+            "BetaTest#test_ours|fail|test/beta_test\n"
+            "BetaTest#test_env_passing|pass|test/beta_test\n",
+        )
+        baseline = json.loads((self.dir / "baseline.json").read_text())
+        baseline["tests"] = [
+            {"name": f"BetaTest#{t}", "file": "test/beta_test.rb", "status": s}
+            for t, s in [
+                ("test_env_listed", "fail"),
+                ("test_env_unlisted", "fail"),
+                ("test_ours", "pass"),
+                ("test_env_passing", "fail"),
+            ]
+        ]
+        write(self.dir / "baseline.json", json.dumps(baseline))
+        summary, _ = self._join()
+        self.assertEqual(summary["rows"]["env"], 3)
+        self.assertEqual(summary["rows"]["gap"], 1)
+        self.assertEqual(summary["tests"]["failed"], 3)
+        charged = {c["slug"]: c["failures"] for c in summary["causes"] if c["failures"]}
+        self.assertEqual(charged, {"unclassified": 1})
+
     def test_sha_mismatch_refuses_to_join(self):
         summary, stderr = self._join(sha="deadbeef")
         self.assertIsNone(summary["rows"])

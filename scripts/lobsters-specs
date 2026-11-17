@@ -384,9 +384,11 @@ rows = nil
 dropped = []
 env_rows = []
 env_ids = {}
-baseline_meta = nil
+baseline_meta = opts[:rails] ? nil : { "note" => "Not joined: --no-rails skipped Rails' own run." }
 if opts[:rails]
-  baseline_path = File.join(File.dirname(opts[:json]), "rails-baseline.json")
+  # Beside its report and named after it, so two reports in one directory
+  # never read each other's baseline.
+  baseline_path = File.join(File.dirname(opts[:json]), "#{File.basename(opts[:json], ".json")}-rails-baseline.json")
   rcmd = [*runner, "ruby", File.join(ROOT, "scripts", "app-suite-baseline"),
           "--app", "lobsters", "--out", baseline_path,
           *opts[:suites].flat_map { |s| ["--suite", s] }]
@@ -415,7 +417,7 @@ elsif opts[:rails]
                             "this run is #{short.(lob["sha"])}."
     log.(baseline_meta["note"])
   else
-    joined = LobstersJoin.rows(emit_examples: examples, baseline: baseline)
+    joined = LobstersJoin.rows(emit_examples: examples, baseline: baseline, root: opts[:src])
     rows = joined["rows"]
     dropped = joined["dropped"]
     env_rows = joined["env"]
@@ -428,7 +430,7 @@ rules = JSON.parse(File.read(CAUSES_FILE))["causes"]
 emit_failed = examples.select { |e| e["status"] == "failed" }
 # SET ASIDE, not charged. An example that fails on stock Rails says
 # nothing about the emit, so it must not claim a cause's share either.
-failed = emit_failed.reject { |e| env_ids[LobstersJoin.example_id(e["id"])] }
+failed = emit_failed.reject { |e| env_ids[LobstersJoin.example_id(e["id"], opts[:src])] }
 buckets = Hash.new { |h, k| h[k] = [] }
 unclassified = []
 

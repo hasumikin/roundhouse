@@ -30,10 +30,14 @@ module LobstersJoin
 
   module_function
 
-  # `<file>[<scopes>]`, normalized to `spec/…`.
-  def example_id(id)
+  # `<file>[<scopes>]`, normalized to `spec/…`. An absolute id is made
+  # relative to the checkout `root` when given (a checkout can itself sit
+  # under a directory named `spec`); without one, at its first `/spec/`.
+  def example_id(id, root = nil)
     s = id.to_s.sub(%r{\A\./}, "")
-    s.start_with?("/") ? s.sub(%r{\A.*?/spec/}, "spec/") : s
+    return s unless s.start_with?("/")
+    prefix = root && "#{File.expand_path(root)}/"
+    prefix && s.start_with?(prefix) ? s.delete_prefix(prefix) : s.sub(%r{\A.*?/spec/}, "spec/")
   end
 
   # emit_examples: the emit run's `examples` (RSpec JSON), whose status is
@@ -43,16 +47,16 @@ module LobstersJoin
   # Returns rows (counts by status over the examples RAILS runs),
   # dropped and env (each an example record), and env_ids — the ids the
   # caller must keep out of its cause counts.
-  def rows(emit_examples:, baseline:)
+  def rows(emit_examples:, baseline:, root: nil)
     emit_by_id = {}
-    emit_examples.each { |e| emit_by_id[example_id(e["id"])] ||= e }
+    emit_examples.each { |e| emit_by_id[example_id(e["id"], root)] ||= e }
     counts = Hash.new(0)
     dropped = []
     env = []
     env_ids = {}
 
     Array(baseline["tests"]).each do |t|
-      id = example_id(t["id"])
+      id = example_id(t["id"], root)
       e = emit_by_id[id]
       rails_status = t["status"].to_s
       status =
