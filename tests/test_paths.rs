@@ -133,12 +133,10 @@ fn rails_default_glob_reaches_every_test_folder() {
     );
 }
 
-/// A base with no harness is reported however its class is reached: a
-/// base the helper defines on one, and a class on that base, are left
-/// out too, and a body construct the ingest would refuse is not read.
-#[test]
-fn an_unharnessed_base_is_reported_through_a_helper_base() {
-    let app = ingest_files([
+/// Test classes on bases with no harness, reached every way the ingest
+/// handles, beside ones that keep theirs.
+fn unharnessed_tree() -> Vec<(PathBuf, String)> {
+    vec![
         ruby_file("test/models/model_default_test.rb", "ModelDefaultTest"),
         text_file(
             "test/mailers/notice_test.rb",
@@ -186,8 +184,15 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
             "test/mailers/mailers/rooted_test.rb",
             "module Mailers\n  class RootedTest < ::HarnessedBase\n    test \"kept\" do\n    end\n  end\nend\n",
         ),
-    ])
-    .expect("ingest tree");
+    ]
+}
+
+/// A base with no harness is reported however its class is reached: a
+/// base the helper defines on one, and a class on that base, are left
+/// out too, and a body construct the ingest would refuse is not read.
+#[test]
+fn an_unharnessed_base_is_reported_through_a_helper_base() {
+    let app = ingest_files(unharnessed_tree()).expect("ingest tree");
     assert_modules(
         &app,
         &[
@@ -216,6 +221,17 @@ fn an_unharnessed_base_is_reported_through_a_helper_base() {
             "OuterBase < ActionMailer::TestCase",
         ]
     );
+}
+
+/// Under `--continue` a left-out class's body is not read either, so a
+/// construct in it adds no survey gap beside the warning.
+#[test]
+fn a_left_out_class_adds_no_survey_gap() {
+    roundhouse::ingest::survey::activate();
+    let app = ingest_files(unharnessed_tree());
+    let gaps = roundhouse::ingest::survey::drain();
+    assert_eq!(app.expect("ingest tree").test_drops.len(), 10);
+    assert!(gaps.is_empty(), "{gaps:?}");
 }
 
 #[test]

@@ -14740,9 +14740,11 @@ fn ingest_included_test_helper_files<V: Vfs + ?Sized>(
     for (entry, in_test_folder) in candidates {
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         // A test folder's file is a helper only when it holds no test
-        // class; the test-file pass below reads the others.
+        // class; the test-file pass below reads the others, and reports
+        // what it finds there, so this look records nothing.
         if in_test_folder
-            && !ingest_test_files(&source, &entry.display().to_string()).is_ok_and(|tms| tms.is_empty())
+            && !super::survey::without_recording(|| ingest_test_files(&source, &entry.display().to_string()))
+                .is_ok_and(|tms| tms.is_empty())
         {
             continue;
         }
