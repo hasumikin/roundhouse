@@ -507,7 +507,7 @@ out = {
     "total" => summary["example_count"],
     "passed" => examples.count { |e| e["status"] == "passed" },
     "failed" => summary["failure_count"],
-    "set_aside_on_rails" => env_rows.size,
+    "set_aside_on_rails" => emit_failed.size - failed.size,
     "pending" => summary["pending_count"],
     "errors_outside_examples" => summary["errors_outside_of_examples_count"],
     "duration_s" => summary["duration"]&.round(1),

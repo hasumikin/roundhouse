@@ -226,7 +226,9 @@ JSON="$(abs_path "$JSON")"
 EMIT_TESTS="$(abs_path "$EMIT_TESTS")"
 # This run's rows only: each file appends below, and a stale row left from
 # an earlier run would answer for a test this emit no longer generates.
-: > "$EMIT_TESTS"
+if [[ -n "$EMIT_TESTS" ]]; then
+    : > "$EMIT_TESTS"
+fi
 
 case "$TARGET" in
     ruby)   ;;

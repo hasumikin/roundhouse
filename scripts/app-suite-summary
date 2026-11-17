@@ -285,6 +285,12 @@ by_file.each do |f|
   unpassed = f["failed"]
   next if unpassed <= 0
   listed = fails_by_file[f["file"]]
+  # A file that requires another test file also prints that file's FAIL
+  # lines. When the emitted list says which file owns each test, only
+  # this file's own lines count against its unpassed number.
+  if emit_rows.values.any? { |r| r["file"] }
+    listed = listed.select { |t| emit_rows.dig(row_key.(t["test"]), "file").then { _1.nil? || _1 == f["file"] } }
+  end
   # First-match the file's own unpassed count against its per-test lines,
   # THEN drop the env rows: the count already includes them, so filtering
   # before the match would turn them into a phantom shortfall record.
