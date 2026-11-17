@@ -728,6 +728,9 @@ if [[ -n "$JSON" ]]; then
     fi
     if [[ -n "$FILTER" ]]; then
         summary_args+=(--no-join "--filter ran only the files matching $FILTER")
+    elif [[ -n "$REUSE" && -z "$SHA" ]]; then
+        # The checkout may have moved since the reused emit was built.
+        summary_args+=(--no-join "a --reuse emit does not record its source commit; pass --sha to join it")
     fi
     if (( STUBS )); then
         [[ -f "$STUBS_FILE" ]] && summary_args+=(--stubs "$STUBS_FILE")

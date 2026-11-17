@@ -254,8 +254,12 @@ else
   emit_info["by_kind"] = diags.group_by { |_, k| k }.transform_values(&:size)
                               .sort_by { |_, n| -n }.to_h
   emit_info["files"] = err[/(?:wrote|emitted) (\d+) files/, 1]&.to_i
+  # The tree's own record of the commit it was built from, so a later
+  # --emit reuse can be joined only against that commit.
+  File.write(File.join(emit_tree, ".lobsters-source-sha"), "#{lob["sha"]}\n") if lob["sha"] && !lob["dirty"]
 end
 emit_info["path"] = emit_tree
+emit_sha = File.read(File.join(emit_tree, ".lobsters-source-sha")).strip rescue nil
 
 # ── Ruby selection ───────────────────────────────────────────────────
 # The checkout pins a version; a shadowing system Ruby is a known trap.
@@ -410,7 +414,13 @@ elsif opts[:rails]
     "ruby" => baseline["ruby"], "suites" => baseline["suites"],
     "generated_at" => baseline["generated_at"],
   }
-  if baseline["sha"].to_s != lob["sha"].to_s
+  if emit_sha.to_s.empty? || emit_sha != lob["sha"].to_s
+    # A reused tree with no record, or one built from another commit, did
+    # not run the code the baseline ran.
+    baseline_meta["note"] = "Not joined: the emit tree was built from #{short.(emit_sha)}, " \
+                            "the checkout is at #{short.(lob["sha"])}."
+    log.(baseline_meta["note"])
+  elsif baseline["sha"].to_s.empty? || baseline["sha"].to_s != lob["sha"].to_s
     # A join across two commits is a fabricated number: upstream's own
     # moves would read as ours.
     baseline_meta["note"] = "Not joined: the baseline is Rails' run at #{short.(baseline["sha"])}, " \

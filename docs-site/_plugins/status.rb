@@ -133,7 +133,9 @@ module RoundhouseStatus
     problems << "the example counts are missing" unless counts.all? { |n| n.is_a?(Integer) && n >= 0 } && ex["total"].positive?
     problems << "a failure group has no count" unless s.fetch("causes").all? { |c| c["failures"].is_a?(Integer) && c["failures"] >= 0 }
     problems << "the example counts don't add up" unless ex.values_at("passed", "failed", "pending").sum(&:to_i) == ex["total"].to_i
-    problems << "the failure groups don't add up to the failures" unless causes.sum { |c| c["failures"] } == ex["failed"].to_i
+    # lobsters-specs sets aside the failures that also fail on Rails.
+    charged = ex["failed"].to_i - ex["set_aside_on_rails"].to_i
+    problems << "the failure groups don't add up to the failures" unless causes.sum { |c| c["failures"] } == charged
     problems << "a rule with no matches has failures" if causes.any? { |c| c["stale_rule"] && c["failures"].positive? }
     {
       "observed_at" => time_or_nil(s["generated_at"]), "sources" => [url, "#{site}/bench/lobsters-specs/"],
