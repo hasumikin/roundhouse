@@ -9,8 +9,9 @@
 # `$PROGRAM_NAME` is the binary's argv[0]), so a test that required it
 # opened `storage/development.sqlite3` and died with
 # `sqlite3_open(...) failed (14)` before running an assertion. main.rb
-# now keeps the boot in `Main.start`, which only the compile root
-# (`bin/blog.rb`) calls, and starts nothing when it is required.
+# now starts the server in `Main.start`, which only the compile root
+# (`bin/blog.rb`) calls: requiring main.rb runs this chain and starts
+# no server.
 #
 # ONE owner for the order. The harness previously kept its own
 # hand-maintained subset of this list; by the time anyone noticed it was

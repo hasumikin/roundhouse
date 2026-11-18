@@ -566,14 +566,15 @@ fn spinel_gate_literal_json_routes_match() {
     std::fs::remove_dir_all(scratch).expect("clean passing tree");
 }
 
-/// `main.rb` starts nothing when it is required: a compile root that
-/// only requires it reaches its last line and exits. The app's own
-/// root, `bin/blog.rb`, is the one that calls `Main.start`. A program
-/// that links the tree as a library (spinel's `--ext-entry`) relies on
-/// this: it calls `Main.start` after its own setup.
+/// `main.rb` starts no server when it is required: a compile root that
+/// only requires it runs the boot chain, reaches its last line and
+/// exits. The app's own root, `bin/blog.rb`, is the one that calls
+/// `Main.start`. A program that links the tree as a library (spinel's
+/// `--ext-entry`) relies on this: it calls `Main.start` after its own
+/// setup.
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
-fn spinel_gate_main_starts_nothing_when_required() {
+fn spinel_gate_main_starts_no_server_when_required() {
     let scratch = emit_spinel("main-starts-nothing");
     std::fs::write(
         scratch.join("bin/loaded.rb"),

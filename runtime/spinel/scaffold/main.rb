@@ -929,10 +929,13 @@ class MainApp
 end
 
 # The start of the spinel-compiled binary, as a method. The compile
-# root (`bin/blog.rb`) calls it with ARGV. This file starts nothing when
-# it is required, so a test can load it, and a program that links the
-# tree as a library (spinel's --ext-entry) calls `Main.start` at the
-# time it chooses.
+# root (`bin/blog.rb`) calls it with ARGV. Requiring this file starts no
+# server: it runs the boot chain only (boot.rb), so a test can load it,
+# and a program that links the tree as a library (spinel's --ext-entry)
+# calls `Main.start` at the time it chooses. The boot chain is not
+# deferred. With no SECRET_KEY_BASE and no stored key it writes
+# `storage/secret_key_base` (runtime/local_secret.rb), so a host whose
+# tree is read-only gives the key before it loads this file.
 #
 # CLI surface. Flags override the PORT/WORKERS env vars; --help exits
 # before any DB or server setup runs. Parsed with a plain while loop

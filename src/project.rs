@@ -14625,7 +14625,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         "bin/blog.rb".to_string(),
         "# spin compile root: `spin build` → build/bin/blog; `spin run`.\n\
          # The application lives in main.rb (see SPECIMEN.md), which starts\n\
-         # nothing when it is required: this file starts the server (or the\n\
+         # no server when it is required: this file starts the server (or the\n\
          # worker role). Unconditional — the binary's sole purpose is to\n\
          # start; an `if __FILE__ == $PROGRAM_NAME` guard is always false\n\
          # under spinel-AOT (`$PROGRAM_NAME` is the binary's argv[0]). A\n\
@@ -14751,6 +14751,11 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             for (from, to) in dep_patches {
                 makefile.1 = makefile.1.replacen(from, to, 1);
             }
+            // The root `spin build` compiles is a prerequisite too. It is
+            // not in $(RUBY_SRC) (main.rb, runtime, app, config), and it
+            // holds the call that starts the server: an edit of it alone
+            // left `make build` with nothing to do.
+            makefile.1 = makefile.1.replacen("$(BUILD)/blog: $(RUBY_SRC)", "$(BUILD)/blog: bin/blog.rb $(RUBY_SRC)", 1);
         } else if needs_bcrypt || needs_vips || needs_rqrcode || needs_nokogiri || needs_commonmarker || needs_redis {
             return Err(
                 "spin_shape: Makefile dep-patch anchors not found (scaffold \
@@ -15553,7 +15558,7 @@ mod tests {
 
     /// The Spinel main.rb defines the server's start and never calls it:
     /// the compile root does (`bin/blog.rb`, written by `spin_shape`). A
-    /// test or a host program that requires main.rb starts nothing, so
+    /// test or a host program that requires main.rb starts no server, so
     /// the file ends with the method and has no statement after it.
     #[test]
     fn the_spinel_main_defines_its_start_and_does_not_call_it() {
@@ -17066,6 +17071,8 @@ mod tests {
         assert!(mk.contains("SPIN   ?= spin"), "{mk}");
         assert!(mk.contains("\t$(SPIN) build\n\tcp build/bin/blog $@"), "{mk}");
         assert!(!mk.contains("$(SPINEL) main.rb"), "{mk}");
+        // The root `spin build` compiles is a prerequisite of the binary.
+        assert!(mk.contains("$(BUILD)/blog: bin/blog.rb $(RUBY_SRC) $(RBS_SRC)\n"), "{mk}");
     }
 
     /// An app that names RQRCode (a QR code rendered as SVG) gets the
