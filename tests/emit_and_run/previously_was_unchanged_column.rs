@@ -54,6 +54,20 @@ end
     end
     check("after a rollback of the save", r.name_previously_was.nil?)
 
+    # an Array goes out as a copy: a caller that changes the answer inside
+    # the transaction of the save does not change the baseline that a
+    # rollback puts back, so a later change of the record is still pending
+    l = Product.create!(name: "l", stock: 1, labels: ["a"])
+    l = Product.find(l.id)
+    Product.transaction do
+      l.update!(stock: 2)
+      l.labels_previously_was << "b"
+      check("the answer is a copy", l.labels_previously_was == ["a"])
+      raise ActiveRecord::Rollback
+    end
+    l.labels = ["a", "b"]
+    check("pending after the rollback", l.attribute_changed?("labels"))
+
     n = Product.new(name: "n", stock: 1)
     check("new, no save yet", n.stock_previously_was.nil? && n.name_previously_was.nil?)
   end
@@ -63,6 +77,7 @@ end
   create_table "products", force: :cascade do |t|
     t.string "name"
     t.integer "stock"
+    t.string "labels", array: true
   end
 end
 "##)

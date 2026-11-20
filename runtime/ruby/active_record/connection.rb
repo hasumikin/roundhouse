@@ -2678,11 +2678,16 @@ module ActiveRecord
     # Dirty compares none of its values. Only a rollback of the save
     # makes it the baseline again, and that drops it here
     # (`_restore_after_rollback`), as Rails answers nil then.
+    #
+    # An Array goes out as a copy, from the pair too: until the
+    # transaction of the save ends, the replaced baseline is also the one
+    # a rollback puts back, and a caller that appended to the answer
+    # would change what Dirty compares after that rollback.
     def attribute_previously_was(name)
       pair = saved_changes[name]
-      return pair[0] unless pair.nil?
       before = _before_last_save
-      before.nil? ? nil : before[name]
+      value = pair.nil? ? (before.nil? ? nil : before[name]) : pair[0]
+      value.is_a?(Array) ? value.dup : value
     end
 
     # The baseline the last save replaced; nil with no save yet, and
