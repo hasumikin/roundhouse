@@ -2658,9 +2658,18 @@ module ActiveRecord
     # a local before the nil test and the index, the same precaution
     # `saved_change_to_attribute?` documents. Ruby-family only — see
     # base.rb's stub for why the indexing cannot live there.
+    #
+    # A column the last save did not change has no pair, and Rails
+    # answers the value it held before that save, which is the value it
+    # holds after it: the baseline the save left. The Getting Started
+    # store reads `inventory_count_previously_was.zero?` in an
+    # after_update_commit, on every update of a product. A record with
+    # no save yet (new, or hydrated) answers nil, as Rails does.
     def attribute_previously_was(name)
       pair = saved_changes[name]
-      pair.nil? ? nil : pair[0]
+      return pair[0] unless pair.nil?
+      baseline = @__last_saved_attributes
+      @saved_changes.nil? || baseline.nil? ? nil : baseline[name]
     end
 
     # The Dirty baseline: `attributes` with each Array value copied.
