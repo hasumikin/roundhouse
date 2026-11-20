@@ -44,6 +44,16 @@ end
     q.update_columns(name: "d")
     check("after update_columns of the changed column", q.name_previously_was == "b")
 
+    # a rolled-back save is no last save
+    r = Product.find(a.id)
+    r.stock = 7
+    Product.transaction do
+      r.save!
+      check("inside the transaction", r.name_previously_was == "d")
+      raise ActiveRecord::Rollback
+    end
+    check("after a rollback of the save", r.name_previously_was.nil?)
+
     n = Product.new(name: "n", stock: 1)
     check("new, no save yet", n.stock_previously_was.nil? && n.name_previously_was.nil?)
   end

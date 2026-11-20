@@ -129,7 +129,6 @@ module ActiveRecord
     def saved_changes?: () -> bool
     def _wrote_on_update?: () -> bool
     def _attributes_snapshot: () -> Hash[String, untyped]
-    def _baseline_copy: (Hash[String, untyped] baseline) -> Hash[String, untyped]
     def attribute_in_database: (Symbol | String name) -> untyped
     def self.schema_column_types: () -> Hash[Symbol, Symbol]
     def self.schema_integer_query_limits: () -> Hash[Symbol, Integer]
@@ -308,6 +307,8 @@ module ActiveRecord
     def _enlist_write: (Integer kind) -> nil
     def _enlist_direct_write: () -> nil
     def _forget_rollback_state: () -> nil
+    def _before_last_save: () -> Hash[String, untyped]?
+    def _forget_before_last_save: () -> nil
     def _run_commit_callbacks: (Integer kind) -> nil
     def self._txn_parent_joinable?: (Integer depth) -> bool
     def self._txn_note_joinable: (Integer depth, bool joinable) -> nil
