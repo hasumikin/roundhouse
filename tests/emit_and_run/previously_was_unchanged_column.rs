@@ -38,6 +38,12 @@ end
     check("hydrated, the unchanged column", q.stock_previously_was == 0)
     check("hydrated, the changed column", q.name_previously_was == "b")
 
+    # a direct write after the save moves no answer
+    q.update_column(:stock, 5)
+    check("after update_column of the unchanged column", q.stock_previously_was == 0)
+    q.update_columns(name: "d")
+    check("after update_columns of the changed column", q.name_previously_was == "b")
+
     n = Product.new(name: "n", stock: 1)
     check("new, no save yet", n.stock_previously_was.nil? && n.name_previously_was.nil?)
   end

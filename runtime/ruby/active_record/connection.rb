@@ -2635,6 +2635,7 @@ module ActiveRecord
         prev = previous.nil? ? nil : previous[key]
         changes[key] = [prev, value] if prev != value
       end
+      @__before_last_save = previous.nil? ? nil : _baseline_copy(previous)
       @__last_saved_attributes = _attributes_snapshot
       @__touched_updated_at = nil
       @__unloaded_writes = nil
@@ -2660,16 +2661,31 @@ module ActiveRecord
     # base.rb's stub for why the indexing cannot live there.
     #
     # A column the last save did not change has no pair, and Rails
-    # answers the value it held before that save, which is the value it
-    # holds after it: the baseline the save left. The Getting Started
+    # answers the value it held before that save. The Getting Started
     # store reads `inventory_count_previously_was.zero?` in an
     # after_update_commit, on every update of a product. A record with
     # no save yet (new, or hydrated) answers nil, as Rails does.
+    #
+    # The value comes from the copy of the baseline that the last save
+    # took before it moved the baseline (`__track_saved_changes`), not
+    # from the baseline itself: a direct write after the save
+    # (`update_column`) moves the baseline and leaves this answer as it
+    # was, and an Array handed out here is not the one Dirty compares.
     def attribute_previously_was(name)
       pair = saved_changes[name]
       return pair[0] unless pair.nil?
-      baseline = @__last_saved_attributes
-      @saved_changes.nil? || baseline.nil? ? nil : baseline[name]
+      before = @__before_last_save
+      before.nil? ? nil : before[name]
+    end
+
+    # The baseline as it was before the last save, with each Array value
+    # copied, as `_attributes_snapshot` copies them.
+    def _baseline_copy(baseline)
+      copy = {}
+      baseline.each do |key, value|
+        copy[key] = value.is_a?(Array) ? value.dup : value
+      end
+      copy
     end
 
     # The Dirty baseline: `attributes` with each Array value copied.
