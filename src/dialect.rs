@@ -1279,6 +1279,23 @@ pub struct LibraryClass {
 }
 
 impl LibraryClass {
+    /// The first of this opening's spans that points at a source, which
+    /// says the file it was read from. A method's name comes before its
+    /// body: an `attr_reader`'s reader has a synthesized body but the name
+    /// it was written with. A body that only sets a class-level variable
+    /// (`@configured = true`) has that write's span. An opening holding
+    /// nothing but nested classes has none.
+    pub fn source_span(&self) -> Option<Span> {
+        std::iter::once(self.parent_span)
+            .chain(self.include_spans.iter().copied())
+            .chain(self.constants.iter().map(|(_, v)| v.span))
+            .chain(self.methods.iter().map(|m| m.name_span))
+            .chain(self.methods.iter().map(|m| m.body.span))
+            .chain(self.class_ivar_initializers.iter().map(|e| e.span))
+            .chain(self.unknown_calls.iter().map(|c| c.span))
+            .find(|s| !s.is_synthetic())
+    }
+
     /// A file of constants alone, which declares no class
     /// (`LibraryClassOrigin::FileConstants`).
     pub fn is_file_constants(&self) -> bool {
@@ -1443,6 +1460,10 @@ pub enum LibraryClassOrigin {
     },
     /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
     Oj,
+    /// The `MultiJson` stand-in an app on multi_json's oj adapter reaches (`ingest::multi_json`).
+    MultiJson,
+    /// A serializer of an app on active_model_serializers 0.8, its body expanded (`ingest::active_model_serializer_08`).
+    ActiveModelSerializer08,
     /// Not a class: an autoloaded app file that declares no class or
     /// module and holds only file-level constants (`RemoteThing =
     /// Thing`, `Labels = LabelFactory.build(...)`). Named for the

@@ -274,6 +274,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("broadcast_replace_to", Ty::Nil), ("broadcast_update_to", Ty::Nil),
         ("broadcast_remove_to", Ty::Nil),
     ], &[]);
+    // turbo-rails' helper modules, which a component includes (maybe's ApplicationComponent); the runtime defines
+    // them empty, as a template's `turbo_frame_tag` is lowered where it is written.
+    register_stdlib_class(classes, "Turbo::FramesHelper", &[], &[]);
+    register_stdlib_class(classes, "Turbo::StreamsHelper", &[], &[]);
     // `ENV` — a Rails app's configuration seam, and the one stdlib
     // object whose values have a single concrete type: every entry is
     // a String. `fetch` narrows to that, which is right for the two
@@ -826,6 +830,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("select_best_encoding", Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
         ("unescape_path", Ty::Str),
     ], &[]);
+    // `Rack::BodyProxy`, ported into `runtime/ruby/rack_body_proxy.rb` (the rack gem's own on the ruby family): the
+    // body a middleware hands up, its block run once the server closes it.
+    let proxy = Ty::Class { id: ClassId(Symbol::from("Rack::BodyProxy")), args: vec![].into() };
+    register_stdlib_class(classes, "Rack::BodyProxy", &[("new", proxy.clone())], &[
+        ("each", proxy),
+        ("close", Ty::Nil),
+        ("closed?", Ty::Bool),
+    ]);
     // `Rack::Utils::HTTP_STATUS_CODES` — the status-code-to-reason-phrase
     // table every app can reach for (`Rack::Utils::HTTP_STATUS_CODES
     // [code]`, Mastodon's error-response helpers among them). A bare

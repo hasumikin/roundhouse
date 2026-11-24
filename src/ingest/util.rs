@@ -324,6 +324,12 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         collect_classes(&decl, scope, nesting, out);
         return;
     }
+    if let Some(taken) = framework_defined_branch(node) {
+        for stmt in &taken {
+            collect_classes(stmt, scope, nesting, out);
+        }
+        return;
+    }
     if let Some(m) = node.as_module_node() {
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
@@ -549,8 +555,14 @@ fn concern_includes_module(body: Option<Node<'_>>) -> bool {
             call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
         })
     }
+    // `self.extend` is the same call.
     let extends_concern = statements.iter().any(|stmt| {
-        call_named(stmt, "extend").is_some_and(|call| {
+        let call = stmt.as_call_node().filter(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && call.block().is_none()
+                && constant_id_str(&call.name()) == "extend"
+        });
+        call.is_some_and(|call| {
             call.arguments().is_some_and(|a| {
                 a.arguments().iter().any(|arg| {
                     constant_path_of(&arg).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
@@ -880,11 +892,41 @@ pub(super) fn flatten_statements<'pr>(node: Node<'pr>) -> Vec<Node<'pr>> {
     if let Some(s) = node.as_statements_node() {
         s.body().iter().flat_map(|stmt| match self_guarded_body(&stmt, None) {
             Some(body) => vec![body],
-            None => vec![stmt],
+            None => framework_defined_branch(&stmt).unwrap_or_else(|| vec![stmt]),
         }).collect()
     } else {
         vec![node]
     }
+}
+
+/// Constants every Rails this compiler reads defines before any app or gem file loads.
+const FRAMEWORK_DEFINED: &[&str] = &["ActiveSupport::CurrentAttributes", "ActionDispatch::RequestId", "Rails::Railtie", "Rails::Engine"];
+
+/// `if defined?(ActiveSupport::CurrentAttributes) … else … end` (rails-settings-cached's `RequestCache`): the branch
+/// Ruby takes, as the guarded constant is always defined; the other is for a Rails this compiler does not read.
+fn framework_defined_branch<'pr>(node: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
+    let branch = node.as_if_node()?;
+    branch.end_keyword_loc()?;
+    let predicate = branch.predicate();
+    let path = match predicate.as_defined_node() {
+        Some(defined) => constant_path_of(&defined.value())?,
+        // `ActionDispatch.const_defined?(:RequestId)` (request_store's Railtie) asks the same of the owner.
+        None => {
+            let call = predicate.as_call_node()?;
+            if constant_id_str(&call.name()) != "const_defined?" {
+                return None;
+            }
+            let owner = constant_path_of(&call.receiver()?)?;
+            let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+            let [name] = args.as_slice() else { return None };
+            let name = String::from_utf8_lossy(name.as_symbol_node()?.unescaped()).into_owned();
+            owner.into_iter().chain(std::iter::once(name)).collect()
+        }
+    };
+    if !FRAMEWORK_DEFINED.contains(&path.join("::").trim_start_matches("::")) {
+        return None;
+    }
+    Some(branch.statements().map(|s| s.body().iter().collect()).unwrap_or_default())
 }
 
 // Only a reload guard around its own declaration: any other guard, or an `else`, takes the branch what else loaded decides.

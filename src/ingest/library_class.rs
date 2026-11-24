@@ -175,6 +175,149 @@ pub fn ingest_library_classes(
     ingest_library_classes_impl(source, file, Walk::All)
 }
 
+/// The top-level `Const.class_eval do … end` (or `module_eval`) blocks of
+/// a file that hold nothing but `def`s, each as an opening of `Const` with
+/// the statement's start offset. In the block `self` is `Const`, so a `def`
+/// there defines what the same `def` in a `class Const` body would. A
+/// block with parameters, arguments or any other statement is not taken:
+/// a constant written there belongs to the block's lexical scope, not to
+/// `Const`, and a local it reads is the enclosing scope's. The opening is
+/// read as a class's (`is_module: false`); whoever keeps it gives it the
+/// kind of the declaration it reopens.
+///
+/// A block the ingest refuses is left out on its own: the file's other
+/// blocks are still read. Each opening comes with the bare constants its
+/// block reads (`TOKEN`, the `Helper` of `Helper.call`). Ruby looks those
+/// up in the block's lexical scope, the top level, not in `Const`.
+pub fn class_eval_openings(source: &[u8], file: &str) -> IngestResult<Vec<ClassEvalOpening>> {
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for node in program.statements().body().iter() {
+        let Some(call) = node.as_call_node() else { continue };
+        if !matches!(call.name().as_slice(), b"class_eval" | b"module_eval") || call.arguments().is_some() {
+            continue;
+        }
+        let Some(path) = call.receiver().and_then(|receiver| constant_path_of(&receiver)) else { continue };
+        let Some(block) = call.block().and_then(|block| block.as_block_node()) else { continue };
+        if block.parameters().is_some() {
+            continue;
+        }
+        let Some(statements) = block.body().and_then(|body| body.as_statements_node()) else { continue };
+        // `def Other.x` in the block defines on `Other`: only a `def` on
+        // the block's `self` is the class's.
+        if !statements.body().iter().all(|statement| {
+            statement.as_def_node().is_some_and(|def| def.receiver().is_none_or(|r| r.as_self_node().is_some()))
+        }) {
+            continue;
+        }
+        // A class variable is looked up in the block's lexical scope, the
+        // top level, where an opening would find the class's.
+        if refers_to_class_variable(&statements.as_node()) {
+            continue;
+        }
+        let owner = ClassId(Symbol::from(path.join("::")));
+        let DeclBody {
+            includes,
+            include_spans,
+            methods,
+            constants,
+            unknown_calls,
+            class_initializers,
+            class_attributes: _,
+            conditional_definitions,
+        } = match walk_decl_body(block.body(), &owner, file, DeclBodyMode::Instance) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let (bare_constants, rooted_constants) = constant_reads(&statements.as_node());
+        let opening = LibraryClass {
+            name: owner,
+            is_module: false,
+            parent: None,
+            parent_span: Span::synthetic(),
+            includes,
+            include_spans,
+            methods,
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants,
+            conditional_definitions,
+            unknown_calls,
+            class_ivar_initializers: class_initializers,
+        };
+        out.push(ClassEvalOpening { start: node.location().start_offset() as u32, opening, bare_constants, rooted_constants });
+    }
+    Ok(out)
+}
+
+/// Whether `node` reads or writes a class variable anywhere, `defined?(@@x)` included.
+fn refers_to_class_variable(node: &ruby_prism::Node<'_>) -> bool {
+    struct Found(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Found {
+        fn visit_class_variable_read_node(&mut self, _: &ruby_prism::ClassVariableReadNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_write_node(&mut self, _: &ruby_prism::ClassVariableWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_target_node(&mut self, _: &ruby_prism::ClassVariableTargetNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_operator_write_node(&mut self, _: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_and_write_node(&mut self, _: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_variable_or_write_node(&mut self, _: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut found = Found(false);
+    ruby_prism::Visit::visit(&mut found, node);
+    found.0
+}
+
+/// The constants `node` reads: bare (`TOKEN`, the `Helper` of
+/// `Helper.call`), which Ruby looks up lexically, and rooted (`::Helper`),
+/// which name the top level's. Each sorted, without repeats.
+pub(crate) fn constant_reads(node: &ruby_prism::Node<'_>) -> (Vec<String>, Vec<String>) {
+    struct Reads(Vec<String>, Vec<String>);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            self.0.push(constant_id_str(&node.name()).to_string());
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if node.parent().is_none() {
+                if let Some(name) = node.name() {
+                    self.1.push(constant_id_str(&name).to_string());
+                }
+            }
+            ruby_prism::visit_constant_path_node(self, node);
+        }
+    }
+    let mut reads = Reads(Vec::new(), Vec::new());
+    ruby_prism::Visit::visit(&mut reads, node);
+    for list in [&mut reads.0, &mut reads.1] {
+        list.sort();
+        list.dedup();
+    }
+    (reads.0, reads.1)
+}
+
+/// One opening [`class_eval_openings`] reads.
+pub struct ClassEvalOpening {
+    /// The statement's start offset in its file.
+    pub start: u32,
+    pub opening: LibraryClass,
+    /// The bare constant names the block reads, sorted.
+    pub bare_constants: Vec<String>,
+    /// The top-level names it reads rooted (`::Helper`), sorted.
+    pub rooted_constants: Vec<String>,
+}
+
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
 /// (`app/models`, the autoloaded support dirs): a file that declares no
 /// class or module but writes file-level constants still defines them,
@@ -1380,7 +1523,7 @@ pub(super) fn library_class_and_struct_base(
     };
     let base = struct_members
         .as_ref()
-        .map(|members| struct_base_class(&owner, members));
+        .map(|(members, keyword_init)| struct_base_class(&owner, members, *keyword_init));
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok((
         LibraryClass {
@@ -2152,7 +2295,7 @@ fn synth_struct_equality(owner: &ClassId, members: &[SorbetStructMember]) -> Met
 /// end` carrying a body: both mean something this synthesis does not
 /// supply, and answering as though they were the positional form would
 /// build a class with the wrong constructor.
-fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<Vec<Symbol>> {
+fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<(Vec<Symbol>, bool)> {
     let call = node.as_call_node()?;
     if call.name().as_slice() != b"new" || call.block().is_some() {
         return None;
@@ -2163,16 +2306,29 @@ fn struct_superclass_members(node: &ruby_prism::Node<'_>) -> Option<Vec<Symbol>>
     }
     let args = call.arguments()?;
     let mut members = Vec::new();
+    let mut keyword_init = false;
     for arg in args.arguments().iter() {
-        // Symbol literals only — a `keyword_init:` keyword arrives as a
-        // KeywordHashNode and lands here as a non-symbol, which is what
-        // makes this a rejection rather than a silent drop.
+        // A trailing `keyword_init: true` alone (rails-settings-cached's `Fields::Base`); any other keyword is a
+        // constructor this synthesis does not supply, so it rejects.
+        if let Some(hash) = arg.as_keyword_hash_node() {
+            let pairs: Vec<_> = hash.elements().iter().collect();
+            let [pair] = pairs.as_slice() else { return None };
+            let pair = pair.as_assoc_node()?;
+            if symbol_value(&pair.key()).as_deref() != Some("keyword_init") || pair.value().as_true_node().is_none() {
+                return None;
+            }
+            keyword_init = true;
+            continue;
+        }
+        if keyword_init {
+            return None;
+        }
         members.push(Symbol::from(symbol_value(&arg)?));
     }
     if members.is_empty() {
         return None;
     }
-    Some(members)
+    Some((members, keyword_init))
 }
 
 /// The name given to the anonymous struct that stood in superclass
@@ -2198,11 +2354,11 @@ fn struct_base_id(owner: &ClassId) -> ClassId {
 ///
 /// Every parameter defaults to nil, matching Struct: `Point.new(1)`
 /// leaves `y` nil rather than raising.
-fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
+fn struct_base_class(owner: &ClassId, members: &[Symbol], keyword_init: bool) -> LibraryClass {
     struct_class(
         struct_base_id(owner),
         members,
-        false,
+        keyword_init,
         crate::dialect::LibraryClassOrigin::StructSuperclass {
             owner: owner.0.clone(),
             members: members.to_vec(),
@@ -2917,7 +3073,7 @@ fn conditional_definitions(
             statements: Vec::new(),
         };
         for stmt in stmts {
-            if visibility::self_write(&stmt).is_some() {
+            if visibility::self_write(&stmt).is_some() || visibility::branch_load(&stmt).is_some() {
                 arm.statements.push(ingest_expr(&stmt, file)?);
                 continue;
             }
@@ -4594,11 +4750,32 @@ fn walk_decl_body_with_visibility<'pr>(
         let mut classes = parsed?;
         let Some(class) = classes.pop() else { continue };
         // Not its methods alone: an `include` or another class-body call the string makes is the body's too.
+        // Each has the loop's span, as it runs there: a name the string spells (`include Leaf`, the host's nested
+        // `Leaf`) is looked up in the loop, and an `extend` it makes runs after the includes written ahead of the
+        // loop. The includes come where the loop stands: after the ones written before it, ahead of an ordinary
+        // `include` written after it, which Ruby runs later.
+        let at_loop = Span { file: super::sources::file_id(file), start, end };
+        let spanned = out.include_spans.len() == out.includes.len();
+        let mut at = if spanned {
+            out.include_spans.iter().take_while(|span| span.is_synthetic() || span.start < end).count()
+        } else {
+            out.includes.len()
+        };
         for include in &class.includes {
-            out.includes.push(include.clone());
-            out.include_spans.push(Span { file: super::sources::file_id(file), start, end });
+            if spanned {
+                out.includes.insert(at, include.clone());
+                out.include_spans.insert(at, at_loop);
+                at += 1;
+            } else {
+                out.includes.push(include.clone());
+                out.include_spans.push(at_loop);
+            }
         }
-        out.unknown_calls.extend(class.unknown_calls.iter().cloned());
+        out.unknown_calls.extend(class.unknown_calls.iter().map(|call| {
+            let mut call = call.clone();
+            call.span = at_loop;
+            call
+        }));
         for mut method in class.methods {
             // A `module ClassMethods` body's methods are the includer's class side, as its own `def`s are.
             if matches!(mode, DeclBodyMode::ClassMethods) && method.receiver == MethodReceiver::Instance {
@@ -5711,6 +5888,8 @@ pub struct ModelBases {
     /// Every concrete model under `app/models`, with the table its body declares (`concrete_model_table`).
     concrete: crate::det::HashMap<String, Option<String>>,
     concrete_pairs: Vec<(String, Vec<String>, String, Option<String>)>,
+    /// The concrete models a source gem's files declare (rails-settings-cached's `RailsSettings::Base`).
+    gem_concrete: crate::det::HashSet<String>,
 }
 
 impl ModelBases {
@@ -5780,7 +5959,9 @@ impl ModelBases {
             let bare = &parent_path[0];
             for outer in superclass_enclosing(scope, nesting, class) {
                 let candidate = format!("{outer}::{bare}");
-                if own.as_deref() != Some(candidate.as_str()) && self.contains(&candidate) {
+                // A concrete model too (`class Local < Base` in `module RailsSettings`), which the bases set does not hold: the
+                // nearest class of the name, the app's or a gem's, as Ruby looks it up.
+                if own.as_deref() != Some(candidate.as_str()) && (self.contains(&candidate) || self.concrete.contains_key(&candidate)) {
                     return Some(candidate);
                 }
             }
@@ -5830,11 +6011,19 @@ impl ModelBases {
             let Some(parent) = self.resolve_class_superclass(&scope, &nesting, &class) else { continue };
             let mut full = scope.clone();
             full.extend(path);
-            let table = class.body().and_then(|body| super::model::table_name_decl(body, file));
+            let table = super::model::table_name_decl(&class, file);
             // A bare parent is kept with the modules it is looked up through ([`superclass_enclosing`]): a concrete `Admin::Base` is found from `module Admin`, and from `module Ledger; class ::Special < Item` its `Ledger::Item`.
             let lexical = if class.superclass().and_then(|n| constant_path_of(&n)).is_some_and(|p| p.len() == 1) { superclass_enclosing(&scope, &nesting, &class) } else { Vec::new() };
+            if file.contains(super::source_gems::MOUNT) {
+                self.gem_concrete.insert(full.join("::"));
+            }
             self.concrete_pairs.push((full.join("::"), lexical, parent, table));
         }
+    }
+
+    /// A concrete model a source gem declares, which an app class subclasses as Rails does its own models.
+    pub fn is_gem_concrete_model(&self, name: &str) -> bool {
+        self.gem_concrete.contains(name) && self.concrete.contains_key(name)
     }
 
     /// The concrete models: a class whose parent is a base, or (single-table inheritance) another concrete model.
@@ -6055,6 +6244,47 @@ pub fn is_tableless_active_model(source: &[u8]) -> bool {
     class.superclass().is_none() && includes_active_model(&class)
 }
 
+/// `is_tableless_active_model` for an app `lib/` file whose class is the app's own (maybe's `Money`), not one it opens
+/// under a framework namespace (`ActionText::Attachment::OpengraphEmbed`), which `lower::active_model_model` keeps.
+pub fn is_app_tableless_active_model(source: &[u8]) -> bool {
+    let result = parse(source);
+    let root = result.node();
+    let Some((scope, class)) = super::util::primary_class_with_scope(&root) else {
+        return false;
+    };
+    let Some(path) = class_name_path(&class) else { return false };
+    let top = scope.first().or(path.first()).map(String::as_str).unwrap_or("");
+    let framework = matches!(
+        top,
+        "Rails" | "ActiveSupport" | "ActiveRecord" | "ActiveModel" | "ActiveJob" | "ActionPack" | "ActionController"
+            | "ActionDispatch" | "AbstractController" | "ActionView" | "ActionMailer" | "ActionCable" | "ActionText"
+            | "ActiveStorage" | "ActionMailbox"
+    );
+    // Not `ActiveModel::Model` (discourse's `Wizard::StepUpdater`): its own `initialize` and ivars keep
+    // `lower::active_model_model`'s treatment, which the model path would replace.
+    let validations_only = class.body().and_then(|b| b.as_statements_node()).is_some_and(|stmts| {
+        stmts.body().iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.name().as_slice() == b"include"
+                    && call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| {
+                        constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveModel::Validations")
+                    }))
+            })
+        })
+    });
+    let includes_model = class.body().and_then(|b| b.as_statements_node()).is_some_and(|stmts| {
+        stmts.body().iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none() && call.name().as_slice() == b"include"
+                    && call.arguments().is_some_and(|args| args.arguments().iter().any(|arg| {
+                        constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveModel::Model")
+                    }))
+            })
+        })
+    });
+    !framework && class.superclass().is_none() && validations_only && !includes_model && includes_active_model(&class)
+}
+
 pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKind> {
     let result = parse(source);
     let root = result.node();
@@ -6096,6 +6326,9 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         // Resolved through the app's own bases, not against two
         // literals: `Gauge < PkgRecord < ApplicationRecord` is a model.
         Some(p) if bases.contains(p) => ClassKind::Model,
+        // A subclass of a concrete model a gem defines (maybe's `Setting < RailsSettings::Base`): a model, on its table.
+        // Not the app's own (single-table inheritance has its own path), only a gem's.
+        Some(p) if bases.is_gem_concrete_model(p) => ClassKind::Model,
         // A superclass-less class that `include`s the ActiveModel
         // validation surface (lobsters' Search) is a tableless model:
         // the model path lowers its `validates` DSL and synthesizes

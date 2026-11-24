@@ -95,9 +95,32 @@ pub(super) fn ingest_model_with_enum_constants(
     // prefix comes from the nearest module parent that declares one,
     // searched innermost-out the way `module_parents` walks.
     let table_decl = class.body().map(|body| parse_table_name_decl(body, file)).transpose()?.flatten();
-    let table_name = if let Some((name, _)) = &table_decl {
+    let table_name = if let Some((name, _)) = &table_decl
+        && !name.starts_with(TABLE_PREFIX_MARK)
+    {
         name.clone()
+    } else if let Some((name, _)) = &table_decl {
+        if class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "`table_name_prefix + …` in a class that sets its prefix more than once reads the one before it, which is not modeled".into(),
+            });
+        }
+        // The class attribute as Rails reads it: the class body's own `table_name_prefix =`, else the base's.
+        let prefix = class.body().and_then(table_prefix::explicit_table_prefix)
+            .or_else(|| model_bases.resolve_class_superclass(&scope, &nesting, &class).and_then(|parent| base_prefixes.get(&parent).cloned()))
+            .unwrap_or_default();
+        // Not checked before the prefix is known: `"archive_" + "2026"` is a table name, `"2026"` alone is not.
+        let table = format!("{prefix}{}", name.trim_start_matches(TABLE_PREFIX_MARK));
+        if !bare_table_identifier(&table) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "table_name binding requires one direct self.table_name assignment to a literal string or symbol naming a safe bare SQL identifier".into(),
+            });
+        }
+        table
     } else {
+        let mut return_table: Option<String> = None;
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
         let mut prefix = class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default();
@@ -119,10 +142,18 @@ pub(super) fn ingest_model_with_enum_constants(
         {
             prefix = inherited.clone();
         }
+        // A subclass of a gem's concrete model (maybe's `Setting < RailsSettings::Base`) is on its parent's table, as
+        // Rails' single-table inheritance keeps it.
+        if let Some(parent) = model_bases.resolve_class_superclass(&scope, &nesting, &class)
+            && model_bases.is_gem_concrete_model(&parent)
+            && let Some(Some(table)) = model_bases.concrete_model_table(&parent)
+        {
+            return_table = Some(table.to_string());
+        }
         // Rails' `compute_table_name`: a class nested in a concrete model takes that model's singular table first
         // (`Rule::Condition` is `rule_conditions`; under `self.table_name = "entries"`, `entry_notes`). Not where the
         // schema lacks the nested table: the bare name is what the tree held before.
-        nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str())))
+        return_table.unwrap_or_else(|| nested_table(class_name.as_str(), &prefix, schema, model_bases).unwrap_or_else(|| format!("{prefix}{}", crate::naming::rails_table_name(class_name.as_str()))))
     };
 
     let attributes = if let Some(table) = schema.tables.get(&Symbol::from(table_name.as_str())) {
@@ -147,13 +178,28 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut primary_key: Option<Symbol> = None;
     // A model body's load-time conditional definitions are not carried
     // (the model lowering writes no conditional), so the model stays
-    // refused for one, as before the library walk admitted them.
+    // refused for one, as before the library walk admitted them. One whose
+    // branches only load (`include` / `require`) defines nothing: it is
+    // settled here, or refused by name (`settle_load_only_conditional`).
+    let mut settled_loads: crate::det::HashMap<usize, Option<Node<'_>>> = crate::det::HashMap::default();
     if let Some(body) = class.body() {
-        if flatten_statements(body).iter().any(|stmt| super::visibility::conditional_definition(stmt).is_some()) {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "conditional or dynamic visibility declarations are not modeled".into(),
-            });
+        let lexical: Vec<String> = std::iter::once(class_name.to_string()).chain(enum_owners.iter().cloned()).collect();
+        for stmt in flatten_statements(body) {
+            if super::visibility::conditional_definition(&stmt).is_none() {
+                continue;
+            }
+            let at = stmt.location().start_offset();
+            match settle_load_only_conditional(stmt, &lexical, enum_constants, &root, file) {
+                Some(settled) => {
+                    settled_loads.insert(at, settled?);
+                }
+                None => {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "conditional or dynamic visibility declarations are not modeled".into(),
+                    });
+                }
+            }
         }
     }
     let visibility = Visibility::resolve_carrying_inherited(class.body().as_ref(), file, None)?;
@@ -206,6 +252,13 @@ pub(super) fn ingest_model_with_enum_constants(
         }
         let mut walk: Vec<WalkStmt<'_>> = Vec::with_capacity(stmts.len());
         for (at, statement) in stmts.into_iter().enumerate() {
+            // A settled load-only conditional: the include its branch is, or nothing.
+            if let Some(settled) = settled_loads.remove(&statement.location().start_offset()) {
+                if let Some(include) = settled {
+                    walk.push(WalkStmt { node: include, file, source, hook: None });
+                }
+                continue;
+            }
             let fired = super::load_hooks::fired_by(&statement).is_some();
             walk.push(WalkStmt { node: statement, file, source, hook: None });
             if !fired {
@@ -645,6 +698,107 @@ struct WalkStmt<'a> {
     source: &'a [u8],
     /// The hook the statement came from, when it was spliced.
     hook: Option<&'a str>,
+}
+
+/// A model body's load-time conditional whose branches only load
+/// (`visibility::load_only_conditional`), as Ruby runs it, or `None` for any
+/// other conditional (#2282). `if defined?(Const)`, with at most an empty
+/// `else`, settles when the recorded sources answer the guard: when nothing
+/// could define `Const` the branch never runs (`Ok(None)`); when one of
+/// `owners`' (the model class first) spellings of it is defined and the branch is `include Const`
+/// alone, the branch is that include. Every other one is refused by what
+/// it is: a constant Ruby, the framework or an ancestor may define, one the
+/// model's own file declares (`file_root`: whether that runs before the
+/// guard is not what the recorded constants say), a branch doing more than
+/// include the guarded module, or another guard.
+// Not the modifier form (`include M if defined?(M)`): no `end`, so not a
+// conditional definition, and left as it was.
+fn settle_load_only_conditional<'pr>(
+    node: Node<'pr>,
+    owners: &[String],
+    enum_constants: &EnumConstants,
+    file_root: &Node<'_>,
+    file: &str,
+) -> Option<IngestResult<Option<Node<'pr>>>> {
+    let (negated, arms) = visibility::load_only_conditional(&node)?;
+    let refuse = |why: String| {
+        Some(Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("a load-time conditional `include` or `require` in a model body is not modeled: {why}"),
+        }))
+    };
+    let mut arms = arms.into_iter();
+    let Some((Some(predicate), stmts)) = arms.next() else { return refuse("its condition is not `defined?` of a constant".into()) };
+    if negated || !arms.all(|(condition, rest)| condition.is_none() && rest.is_empty()) {
+        return refuse("its condition is not `defined?` of a constant".into());
+    }
+    let Some(written) = predicate.as_defined_node().and_then(|d| EnumConstants::path(&d.value())) else {
+        return refuse("its condition is not `defined?` of a constant".into());
+    };
+    let segments: Vec<&str> = written.trim_start_matches("::").split("::").collect();
+    let root = segments[0];
+    // Defined by Ruby or the framework, which no recorded source declares.
+    let runtime = super::app::FRAMEWORK_ROOTS.contains(&root)
+        || crate::gems::is_stdlib_namespace(root)
+        || crate::gems::is_core_constant(&segments)
+        || crate::gems::preloaded_constant(root);
+    let declared_here = declares_constant_named(file_root, segments[segments.len() - 1]);
+    match (!runtime && !declared_here).then(|| enum_constants.guarded_constant(&written, owners, &owners[0])).flatten() {
+        Some(false) => Some(Ok(None)),
+        Some(true) => {
+            let includes_guarded = |stmt: &Node<'_>| {
+                stmt.as_call_node().is_some_and(|call| {
+                    constant_id_str(&call.name()) == "include"
+                        && call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| EnumConstants::path(&a)).as_deref() == Some(written.as_str())
+                })
+            };
+            match <[Node<'pr>; 1]>::try_from(stmts) {
+                Ok([only]) if includes_guarded(&only) => Some(Ok(Some(only))),
+                _ => refuse(format!("`{written}` is defined, and the branch does more than include it")),
+            }
+        }
+        None => refuse(format!("whether `{written}` is defined where the model loads is not known here")),
+    }
+}
+
+/// Whether the file declares a class, module or constant whose own name is
+/// `name`, at any depth (`module Auditable`, `Tracking::Auditable = …`).
+fn declares_constant_named(root: &Node<'_>, name: &str) -> bool {
+    struct Declares<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl Declares<'_> {
+        fn path(&mut self, path: &Node<'_>) {
+            let own = if let Some(read) = path.as_constant_read_node() {
+                Some(read.name())
+            } else {
+                path.as_constant_path_node().and_then(|p| p.name())
+            };
+            self.found |= own.is_some_and(|n| constant_id_str(&n) == self.name);
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declares<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_class_node(self, node);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.path(&node.constant_path());
+            ruby_prism::visit_module_node(self, node);
+        }
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.found |= constant_id_str(&node.name()) == self.name;
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            self.found |= node.target().name().is_some_and(|n| constant_id_str(&n) == self.name);
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+    }
+    let mut declares = Declares { name, found: false };
+    ruby_prism::Visit::visit(&mut declares, root);
+    declares.found
 }
 
 /// Where the previous statement ended, for the blank line before the next one.
@@ -3790,6 +3944,15 @@ fn parse_callback(
                 let assoc = el.as_assoc_node()?;
                 let key = symbol_value(&assoc.key())?;
                 match key.as_str() {
+                    // Every lifecycle listed (rails-settings-cached's `on: %i[create update destroy]`) is no `on:`
+                    // at all; a subset of them is not modeled, so it rejects.
+                    // Not a validation hook's: there `on:` is the validation context, which a plain `valid?` lacks.
+                    "on" if matches!(hook, CallbackHook::AfterCommit) && assoc.value().as_array_node().is_some_and(|list| {
+                        let mut named: Vec<String> = list.elements().iter().filter_map(|e| symbol_value(&e)).collect();
+                        named.sort();
+                        named.dedup();
+                        list.elements().iter().count() >= 3 && named == ["create", "destroy", "update"]
+                    }) => {}
                     "on" => {
                         on = Some(match symbol_value(&assoc.value())?.as_str() {
                             "create" => CallbackOn::Create,
@@ -4753,9 +4916,38 @@ fn nested_table(name: &str, prefix: &str, schema: &Schema, bases: &super::librar
     schema.tables.contains_key(&Symbol::from(table.as_str())).then_some(table)
 }
 
+/// `table_name_prefix + "settings"` (rails-settings-cached's `RailsSettings::Base`): the class's own prefix, which the
+/// caller knows, in front of the literal, marked to be filled in.
+const TABLE_PREFIX_MARK: char = '\u{1}';
+
+fn prefixed_table(arg: &Node<'_>) -> Option<String> {
+    let call = arg.as_call_node()?;
+    if constant_id_str(&call.name()) != "+" {
+        return None;
+    }
+    let reader = call.receiver()?.as_call_node()?;
+    if constant_id_str(&reader.name()) != "table_name_prefix" || reader.arguments().is_some()
+        || reader.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args = call.arguments()?;
+    let rest: Vec<_> = args.arguments().iter().collect();
+    let [rest] = rest.as_slice() else { return None };
+    Some(format!("{TABLE_PREFIX_MARK}{}", string_value(rest)?))
+}
+
 /// The table a class body declares (`self.table_name = "entries"`), read leniently for the model prepass.
-pub(super) fn table_name_decl(body: Node<'_>, file: &str) -> Option<String> {
-    parse_table_name_decl(body, file).ok().flatten().map(|(name, _)| name)
+pub(super) fn table_name_decl(class: &ruby_prism::ClassNode<'_>, file: &str) -> Option<String> {
+    let name = parse_table_name_decl(class.body()?, file).ok().flatten().map(|(name, _)| name)?;
+    if name.starts_with(TABLE_PREFIX_MARK) && class.body().is_some_and(|b| table_prefix::table_prefix_definitions(b) > 1) {
+        return None;
+    }
+    // Not the marked name: the prepass reads it as a table, so the prefix the class body sets (else none) goes in front.
+    Some(match name.strip_prefix(TABLE_PREFIX_MARK) {
+        Some(rest) => format!("{}{rest}", class.body().and_then(table_prefix::explicit_table_prefix).unwrap_or_default()),
+        None => name,
+    })
 }
 
 fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(String, usize)>> {
@@ -4774,8 +4966,10 @@ fn parse_table_name_decl(body: Node<'_>, file: &str) -> IngestResult<Option<(Str
                 let name = valid.then_some(())
                     .and_then(|_| call.arguments())
                     .filter(|args| args.arguments().len() == 1)
-                    .and_then(|args| symbol_or_string_value(&args.arguments().iter().next()?))
-                    .filter(|name| bare_table_identifier(name));
+                    .and_then(|args| {
+                        let arg = args.arguments().iter().next()?;
+                        symbol_or_string_value(&arg).filter(|name| bare_table_identifier(name)).or_else(|| prefixed_table(&arg))
+                    });
                 self.writes.push(name.map(|name| (name, offset)));
             } else {
                 let name = node.as_call_and_write_node().map(|w| w.write_name())

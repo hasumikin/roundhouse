@@ -637,6 +637,15 @@ fn widen_key_contract(app: &App, files: &mut [(String, String)]) -> Result<(), S
         ));
     }
     *relation = relation.replace(ids_narrow, ids_wide);
+    // Relation#uuid_record_key answers a record's key, nil when unsaved.
+    let key_narrow = "    def uuid_record_key: (Base record) -> Integer?\n";
+    let key_wide = "    def uuid_record_key: (Base record) -> (Integer | String)?\n";
+    if !relation.contains(key_narrow) {
+        return Err(format!(
+            "widen_key_contract: relation.rbs no longer declares {key_narrow:?}"
+        ));
+    }
+    *relation = relation.replace(key_narrow, key_wide);
     Ok(())
 }
 
@@ -3088,11 +3097,21 @@ fn report_partial_binops(app: &App, target: BuildTarget) {
     }
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         if let Some(crate::diagnostic::DiagnosticKind::IncompatibleBinop { op, lhs_ty, rhs_ty }) = &expr.diagnostic()
-            && crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+            && (crate::analyze::some_operands_take_it(op.as_str(), lhs_ty, rhs_ty)
+                || matches!(&*expr.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if r.decisions & crate::expr::NILABLE_OPERATOR_RECEIVER != 0))
         {
             crate::emit::diagnostics::report_unsupported(
                 expr.span, target.as_str(), "operator on some of its operands' types",
                 format!("`{}` takes only some of the types its operands may hold; the ruby family raises for the rest as Ruby does, this target for all", op.as_str()),
+            );
+        }
+        if let crate::expr::ExprNode::Send { method, args, .. } = &*expr.node
+            && let [operand] = args.as_slice()
+            && operand.decisions & crate::expr::COERCED_OPERAND != 0
+        {
+            crate::emit::diagnostics::report_unsupported(
+                expr.span, target.as_str(), "numeric coercion",
+                format!("a number's `{}` with an operand that answers `coerce`: the ruby family runs Ruby's coercion, this target has no such dispatch", method.as_str()),
             );
         }
         expr.node.for_each_child(&mut |child| visit(child, target));
@@ -3548,7 +3567,15 @@ fn target_files_lent(
         return futamura_target_files(app, fixture, None);
     }
     rack_mounts::check_target(app, target)?;
-    let refusals = crate::gems::extension_gem_refusals(app, Some(target.as_str()));
+    // A Rails plugin inferred from the lockfile is analysis's error, which
+    // `--allow-unsupported` downgrades; only these refuse the whole target.
+    // Roda converts the ingest-shape app and runs no type analysis, so no
+    // analysis error reports the reference there: the boundary refuses it.
+    let refusals = if target == BuildTarget::Roda {
+        crate::gems::extension_gem_refusals(app, Some(target.as_str()))
+    } else {
+        crate::gems::extension_gem_boundary_refusals(app, target.as_str())
+    };
     if !refusals.is_empty() {
         let message = refusals.iter().map(|diagnostic| diagnostic.message.as_str()).collect::<Vec<_>>().join("\n");
         for diagnostic in refusals {
@@ -5449,6 +5476,15 @@ fn ruby_family_runtime_files(
                         # manager), which `rack` autoloads, on an entry point no Puma loaded rack for.\n\
                         require \"rack\"\n\
                         require \"rack/utils\"\n"
+                .to_string();
+        }
+        // `Rack::BodyProxy`: the rack gem's own, as for `Rack::Utils`.
+        if path == "runtime/rack_body_proxy.rb" {
+            *content = "# The rack gem's own Rack::BodyProxy — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/rack_body_proxy.rb exists for the targets\n\
+                        # that have no rack to load.\n\
+                        require \"rack\"\n\
+                        require \"rack/body_proxy\"\n"
                 .to_string();
         }
         if path == "runtime/zlib.rb" {
@@ -9657,7 +9693,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         | "JSON::GeneratorError"
         // Ported for spinel (`runtime/ruby/rack_utils.rb`), the gem's own on
         // the ruby family; no strict target loads either.
-        | "Rack::Utils"
+        | "Rack::Utils" | "Rack::BodyProxy"
         // `runtime/ruby/active_support_ext.rb` ships to the ruby family
         // and spinel only.
         | "ActiveSupport::JSON" | "ActiveSupport::Deprecation" | "ActiveSupport::Deprecation::DeprecatedConstantAccessor"
@@ -10313,7 +10349,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         }
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
-            && matches!(path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..], ["RUBY_VERSION" | "RUBY_PLATFORM"] | ["Object", "RUBY_VERSION" | "RUBY_PLATFORM"])
+            && matches!(path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..], ["RUBY_VERSION" | "RUBY_PLATFORM" | "RUBY_ENGINE"] | ["Object", "RUBY_VERSION" | "RUBY_PLATFORM" | "RUBY_ENGINE"])
         {
             emit::diagnostics::report_unsupported(
                 expr.span,
@@ -11555,6 +11591,8 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         // spinel (no rack gem to load); the ruby family swaps it for
         // `require "rack/utils"` below, as ipaddr and zlib are swapped.
         "rack_utils",
+        // rack's `BodyProxy`, ported the same way (request_store's middleware wraps the body in one).
+        "rack_body_proxy",
         // Ruby's `Logger` plus the two ActiveSupport wrappers in front
         // of it. Same arrangement as ipaddr, with one difference the
         // file's header gives: NOT swapped for Ruby's own on the

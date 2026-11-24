@@ -537,6 +537,24 @@ impl Lockfile {
         out
     }
 
+    /// Whether `name` depends on `target`, directly or through its own dependencies.
+    pub fn reaches(&self, name: &str, target: &str) -> bool {
+        let mut seen = crate::det::HashSet::default();
+        let mut pending = vec![name];
+        while let Some(gem) = pending.pop() {
+            if !seen.insert(gem) {
+                continue;
+            }
+            for dep in self.spec_deps.get(gem).into_iter().flatten() {
+                if dep == target {
+                    return true;
+                }
+                pending.push(dep.as_str());
+            }
+        }
+        false
+    }
+
     /// Is `name` resolved from a `GIT` source?
     pub fn is_from_git(&self, name: &str) -> bool {
         self.git_source_of(name).is_some()
@@ -773,6 +791,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
+    ("multi_json", GemFate::Modeled), // ingest/multi_json + lower/oj: on the oj adapter, dump on ruby, jruby and spinel; load, other adapters and every other target refused
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
     ("oj", GemFate::Modeled),          // ingest/oj + lower/oj: under Oj.mimic_JSON, load/generate on ruby, jruby and spinel; dump and every other target refused
     ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); before 43, pagy9.rb: pagy/pagy_array(limit:, page:, items:), readers, series, vars[k], pagy_url_for, the overflow/array extras; other paginators/options/helpers refused
@@ -1169,10 +1188,12 @@ pub fn loads_by_gem_name(gem: &str) -> bool {
 /// which, by definition, it cannot have here.
 pub(crate) fn namespace_candidates(gem: &str) -> Vec<String> {
     let mut candidates = vec![namespace_of(gem)];
-    if let Some((head, _)) = gem.split_once('-') {
-        let first = camelize(head);
-        if !candidates.contains(&first) {
-            candidates.push(first);
+    // Each run of leading words as one name too: rails-settings-cached's is `RailsSettings`.
+    let words: Vec<&str> = gem.split('-').collect();
+    for n in 1..words.len() {
+        let joined = camelize(&words[..n].join("-"));
+        if !candidates.contains(&joined) {
+            candidates.push(joined);
         }
     }
     candidates
@@ -1557,6 +1578,8 @@ enum Owner<'a> {
 struct Refuser<'a> {
     app: &'a crate::App,
     target: Option<&'a str>,
+    /// Whether a `rails_dependent` row inferred from the lockfile owns a path.
+    inferred: bool,
     app_owned: AppConstants,
     owners: std::cell::RefCell<crate::det::HashMap<String, Owner<'a>>>,
 }
@@ -1568,6 +1591,7 @@ impl<'a> Refuser<'a> {
         }
         let app = self.app;
         let owner = if let Some(row) = app.extensions.rails_dependent.iter()
+            .filter(|row| self.inferred || !row.inferred)
             .find(|row| extension_owns_constant(app, &self.app_owned, &row.gem, path))
         {
             Owner::RailsDependent(row)
@@ -1587,6 +1611,19 @@ impl<'a> Refuser<'a> {
 /// Extension-owned constants need both their declared type and a runtime.
 /// `None` checks source analysis; a target also checks native availability.
 pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, target, true)
+}
+
+/// The [`extension_gem_refusals`] that refuse a whole target: not a
+/// `rails_dependent` row inferred from the lockfile (a gem that depends on
+/// railties), whose references analysis reports as errors that
+/// `--allow-unsupported` downgrades, but a row a project extension writes
+/// and a target's native-gem refusals (#2280).
+pub(crate) fn extension_gem_boundary_refusals(app: &crate::App, target: &str) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, Some(target), false)
+}
+
+fn gem_refusals(app: &crate::App, target: Option<&str>, inferred: bool) -> Vec<crate::diagnostic::Diagnostic> {
     use crate::diagnostic::Diagnostic;
     use crate::expr::{Expr, ExprNode};
     use crate::span::Span;
@@ -1605,7 +1642,11 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
                 span,
                 None,
                 "gem_requires_rails",
-                format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why),
+                if row.inferred {
+                    format!("{path}: gem {} {}, so requiring it loads Rails, which no emitted tree carries", row.gem, row.why)
+                } else {
+                    format!("{path}: a project extension marks gem {} rails_dependent: {}", row.gem, row.why)
+                },
             )),
             Owner::Native(owner) => {
                 let target = refuser.target?;
@@ -1634,7 +1675,7 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
         }
         expr.node.for_each_child(&mut |child| visit(child, refuser, defined, out));
     }
-    let refuser = Refuser { app, target, app_owned: AppConstants::of(app), owners: Default::default() };
+    let refuser = Refuser { app, target, inferred, app_owned: AppConstants::of(app), owners: Default::default() };
     let mut out = Vec::new();
     let resolver = app.const_resolver.for_sources(&app.sources);
     let defined = |span, path: &[crate::ident::Symbol]| resolver.has_definition(span, path);
@@ -1977,6 +2018,12 @@ mod tests {
         assert_eq!(lock_gems_owning_constant(&lock, "OmniAuth::Strategies"), ["omniauth"]);
         assert_eq!(lock_gems_owning_constant(&lock, "Sentry"), ["sentry-rails", "sentry-ruby"]);
         assert!(lock_gems_owning_constant(&lock, "Devise").is_empty());
+    }
+
+    #[test]
+    fn a_gem_may_name_its_namespace_by_its_leading_words_joined() {
+        let lock = Lockfile::parse("GEM\n  specs:\n    rails-settings-cached (2.9.6)\n\nDEPENDENCIES\n  rails-settings-cached\n");
+        assert_eq!(lock_gems_owning_constant(&lock, "RailsSettings::Base"), ["rails-settings-cached"]);
     }
 
     #[test]

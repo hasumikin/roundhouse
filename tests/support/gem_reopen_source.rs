@@ -48,6 +48,31 @@ pub const LOCAL_COMPACT: &str = r##"class Shelf::Box
 end
 "##;
 
+/// [`LOCAL`] as a `class_eval` block in an initializer: `self` in the
+/// block is the class, so `def self.…` defines its class methods.
+pub const CLASS_EVAL: &str = r##"Shelf::Box.class_eval do
+  def self.local_tag
+    "local"
+  end
+
+  def self.label
+    "app box"
+  end
+end
+"##;
+
+/// A `class_eval` block that also writes a constant. Ruby puts `LIMIT` in
+/// the block's lexical scope (the top level), not in `Shelf::Box`, so the
+/// block is not the same as a reopen and is left as it is.
+pub const CLASS_EVAL_LIMIT: &str = r##"Shelf::Box.class_eval do
+  LIMIT = 3
+
+  def self.local_tag
+    "local"
+  end
+end
+"##;
+
 /// Adds only a constant and an `include`, no method.
 pub const EXTRAS: &str = r##"module Shelf
   class Box
@@ -84,6 +109,21 @@ end
 pub const LOCAL_ASSERTIONS: &str = r##"got = ArticleBox.describe
 raise "describe #{got.inspect}" unless got == "box / app box / local"
 puts "reopen passed"
+"##;
+
+/// [`models_app`]: Rails 8.1.4.1 never loads the reopen (Zeitwerk loads
+/// `app/models/shelf/box.rb` only for an undefined `Shelf::Box`, and the gem
+/// defined it), with eager loading or without, so the class is the gem's.
+pub const MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.kind, Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "models #{got.inspect}" unless got == ["box", "shelf box", false]
+puts "models passed"
+"##;
+
+/// [`required_models_app`]: Rails 8.1.4.1 loads a file an initializer
+/// requires by path, autoload path or not, so the reopen applies.
+pub const REQUIRED_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.kind, Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "required models #{got.inspect}" unless got == ["box", "app box", true]
+puts "required models passed"
 "##;
 
 pub const EXTRAS_ASSERTIONS: &str = r##"got = BoxLimits.describe + [Shelf::Box::LIMIT]
@@ -126,6 +166,135 @@ pub fn local_app() -> emit_and_run::Overlay {
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 
+/// [`LOCAL`] at `app/models/shelf/box.rb`, the path Zeitwerk maps to
+/// `Shelf::Box`, with no initializer requiring it (#2093's third form).
+#[allow(dead_code)]
+pub fn models_app() -> emit_and_run::Overlay {
+    with_gem().write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// [`models_app`] with an initializer requiring the file by path.
+#[allow(dead_code)]
+pub fn required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "require Rails.root.join(\"app/models/shelf/box\").to_s\n")
+}
+
+/// [`models_app`] with the require split into `Rails.root.join` arguments.
+#[allow(dead_code)]
+pub fn split_required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "require Rails.root.join(\"app\", \"models\", \"shelf\", \"box\").to_s\n")
+}
+
+/// [`models_app`] with an initializer loading `lib/patches.rb`, which loads the reopen: both by `require_relative`.
+#[allow(dead_code)]
+pub fn chain_required_models_app() -> emit_and_run::Overlay {
+    models_app()
+        .write("config/initializers/patches.rb", "require_relative \"../../lib/patches\"\n")
+        .write("lib/patches.rb", "require_relative \"../app/models/shelf/box\"\n")
+}
+
+/// [`models_app`] with the require only in a comment.
+#[allow(dead_code)]
+pub fn commented_required_models_app() -> emit_and_run::Overlay {
+    models_app().write("config/initializers/shelf_box.rb", "# require Rails.root.join(\"app/models/shelf/box\").to_s\n")
+}
+
+/// The gem's `Shelf::Box` assigned (`Box = Class.new(Base)`) rather than declared.
+pub const SHELF_ASSIGNED: &str = r##"module Shelf
+  class Base
+    def self.kind
+      "box"
+    end
+
+    def self.label
+      "shelf box"
+    end
+  end
+
+  Box = Class.new(Base)
+end
+"##;
+
+/// The reopen at `app/models/shelf/box.rb` of a gem class it assigns.
+#[allow(dead_code)]
+pub fn assigned_models_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_ASSIGNED).write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// The gem's class under a namespace the app's acronym inflection names (`API`).
+pub const SHELF_API: &str = r##"module Shelf
+end
+
+module API
+  class Box
+    def self.kind
+      "box"
+    end
+
+    def self.label
+      "shelf box"
+    end
+  end
+end
+"##;
+
+/// The reopen at `app/models/api/box.rb`, which Zeitwerk maps to `API::Box` under `inflect.acronym "API"`.
+#[allow(dead_code)]
+pub fn acronym_models_app() -> emit_and_run::Overlay {
+    with_gem_lib(SHELF_API)
+        .write("config/initializers/inflections.rb", "ActiveSupport::Inflector.inflections(:en) do |inflect|\n  inflect.acronym \"API\"\nend\n")
+        .write("app/models/api/box.rb", &LOCAL.replace("module Shelf", "module API"))
+}
+
+/// A gem whose `Shelf::Box` is in a file of its own, `lib/shelf/box.rb`,
+/// which `lib/shelf.rb` doesn't require.
+fn with_unrequired_gem_box() -> emit_and_run::Overlay {
+    with_gem_lib("module Shelf\nend\n").write(&format!("{GEM_DIR}/lib/shelf/box.rb"), SHELF)
+}
+
+/// [`models_app`] with the gem's `Shelf::Box` in `lib/shelf/box.rb`, which
+/// nothing requires.
+#[allow(dead_code)]
+pub fn unrequired_gem_box_models_app() -> emit_and_run::Overlay {
+    with_unrequired_gem_box().write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// [`models_app`] with the gem's `Shelf::Box` in `lib/shelf/box.rb`, which
+/// the gem autoloads by feature name (`autoload :Box, "shelf/box"`).
+#[allow(dead_code)]
+pub fn feature_autoloaded_gem_box_models_app() -> emit_and_run::Overlay {
+    with_gem_lib("module Shelf\n  autoload :Box, \"shelf/box\"\nend\n")
+        .write(&format!("{GEM_DIR}/lib/shelf/box.rb"), SHELF)
+        .write("app/models/shelf/box.rb", LOCAL)
+}
+
+/// [`unrequired_gem_box_models_app`]: the gem has not defined `Shelf::Box`
+/// when Zeitwerk scans `app/models`, so Rails 8.1.4.1 loads the app's file,
+/// with eager loading or without, and never the gem's.
+#[allow(dead_code)]
+pub const APP_FILE_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.respond_to?(:kind), Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "app file models #{got.inspect}" unless got == [false, "app box", true]
+puts "app file models passed"
+"##;
+
+/// [`feature_autoloaded_gem_box_models_app`]: an autoload to a feature name
+/// doesn't count (Zeitwerk 2.8.3 skips a file only for a defined constant
+/// or an autoload to a `.rb` path), so Rails 8.1.4.1 loads the app's file,
+/// with eager loading or without. It never reads the gem's either, so
+/// `kind` is undefined there, but roundhouse compiles every file the gem's
+/// requires and autoloads reach, as main does, and that half isn't asserted.
+#[allow(dead_code)]
+pub const AUTOLOADED_MODELS_ASSERTIONS: &str = r##"got = [Shelf::Box.label, Shelf::Box.respond_to?(:local_tag)]
+raise "autoloaded models #{got.inspect}" unless got == ["app box", true]
+puts "autoloaded models passed"
+"##;
+
+/// [`acronym_models_app`]: Rails 8.1.4.1 never loads the reopen, so the class is the gem's.
+pub const ACRONYM_MODELS_ASSERTIONS: &str = r##"got = [API::Box.kind, API::Box.label, API::Box.respond_to?(:local_tag)]
+raise "acronym models #{got.inspect}" unless got == ["box", "shelf box", false]
+puts "acronym models passed"
+"##;
+
 /// The reopen that adds only `LIMIT` and `include Tagging`.
 #[allow(dead_code)]
 pub fn extras_app() -> emit_and_run::Overlay {
@@ -150,6 +319,238 @@ pub fn initializer_app() -> emit_and_run::Overlay {
 pub fn compact_initializer_app() -> emit_and_run::Overlay {
     with_gem()
         .write("config/initializers/shelf_box.rb", LOCAL_COMPACT)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The reopen as a `class_eval` block in an initializer (#2093's second form).
+#[allow(dead_code)]
+pub fn class_eval_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write("config/initializers/shelf_box.rb", CLASS_EVAL)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// [`class_eval_app`] with a block that also writes a constant.
+#[allow(dead_code)]
+pub fn class_eval_limit_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write("config/initializers/shelf_box.rb", CLASS_EVAL_LIMIT)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// An initializer's reopen with its own `label`, then the [`CLASS_EVAL`]
+/// block: Ruby runs the file top to bottom, so the block's `label` stands.
+#[allow(dead_code)]
+pub fn reopen_then_class_eval_app() -> emit_and_run::Overlay {
+    let reopen = "class Shelf::Box\n  def self.label\n    \"first\"\n  end\nend\n\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", &format!("{reopen}{CLASS_EVAL}"))
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The same across two initializers: Rails runs them in sorted order, so
+/// `b_box.rb`'s block runs after `a_box.rb`'s reopen.
+#[allow(dead_code)]
+pub fn reopen_then_class_eval_across_files_app() -> emit_and_run::Overlay {
+    let reopen = "class Shelf::Box\n  def self.label\n    \"first\"\n  end\n\n  def self.local_tag\n    \"a\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/a_box.rb", reopen)
+        .write("config/initializers/b_box.rb", CLASS_EVAL)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block whose method calls a helper module the same initializer defines
+/// and nothing in `app/` names. Ruby answers `box / app box / helped`.
+#[allow(dead_code)]
+pub fn class_eval_helper_app() -> emit_and_run::Overlay {
+    let source = "module LabelHelper\n  def self.tag\n    \"helped\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A helper the kept block calls that calls a second helper, both only in
+/// the initializer. Ruby answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_transitive_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  def self.tag\n    TagSource.tag\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+pub const TRANSITIVE_ASSERTIONS: &str = r##"got = ArticleBox.describe
+raise "describe #{got.inspect}" unless got == "box / app box / sourced"
+puts "transitive passed"
+"##;
+
+/// A `class Shelf::Box` reopen in the initializer whose method calls a
+/// helper only the initializer defines. Ruby answers `box / app box /
+/// sourced`.
+#[allow(dead_code)]
+pub fn reopen_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nclass Shelf::Box\n  def self.local_tag\n    TagSource.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper whose parameter default reads another initializer
+/// helper (`def self.tag(value = TagSource.tag)`). Ruby answers the same.
+#[allow(dead_code)]
+pub fn class_eval_default_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  def self.tag(value = TagSource.tag)\n    value\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper whose constant's value reads another initializer helper
+/// (`TAG = TagSource.tag`). Ruby answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_constant_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nmodule LabelHelper\n  TAG = TagSource.tag\n\n  def self.tag\n    TAG\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper that includes a second helper module only the
+/// initializer defines, which nothing names in a method body
+/// (`class LabelHelper; include TagSource`). Ruby answers `box / app box
+/// / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_included_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper\n  include TagSource\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.new.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper that extends a second helper module only the initializer
+/// defines, which nothing names in a method body
+/// (`class LabelHelper; extend TagSource`). Ruby answers `box / app box
+/// / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_extended_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper\n  extend TagSource\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A kept helper whose superclass is a second helper only the initializer
+/// defines (`class LabelHelper < TagSource`). Ruby answers `box / app box
+/// / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_superclass_helper_app() -> emit_and_run::Overlay {
+    let source = "class TagSource\n  def tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper < TagSource\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.new.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// [`class_eval_helper_app`] with the helper named from the top level,
+/// `::LabelHelper.tag`. Ruby answers the same.
+#[allow(dead_code)]
+pub fn class_eval_rooted_helper_app() -> emit_and_run::Overlay {
+    let source = "module LabelHelper\n  def self.tag\n    \"helped\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    ::LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block with a `def` on another receiver (`def Other.label`). Ruby
+/// defines that one on `Other`, not on `Shelf::Box`.
+#[allow(dead_code)]
+pub fn class_eval_other_receiver_app() -> emit_and_run::Overlay {
+    let source = "module Other\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    \"local\"\n  end\n\n  def Other.label\n    \"other\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+pub const HELPER_ASSERTIONS: &str = r##"got = ArticleBox.describe
+raise "describe #{got.inspect}" unless got == "box / app box / helped"
+puts "helper passed"
+"##;
+
+/// The gem's class sets a class variable, and a block's method asks
+/// `defined?(@@configured)`. The block's lexical scope is the top level,
+/// so Ruby 4.0.7 answers `"plain"` there; a `class Shelf::Box` reopening
+/// would answer `"configured"`.
+#[allow(dead_code)]
+pub fn class_eval_class_variable_app() -> emit_and_run::Overlay {
+    let lib = SHELF.replace("  class Box\n", "  class Box\n    @@configured = true\n\n");
+    with_gem_lib(&lib)
+        .write(
+            "config/initializers/shelf_box.rb",
+            "Shelf::Box.class_eval do\n  def self.local_tag\n    defined?(@@configured) ? \"configured\" : \"plain\"\n  end\nend\n",
+        )
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// An initializer reopen gives the gem's class a `TokenSource` of its
+/// own, and a later block in the same file reads `TokenSource` bare.
+/// Ruby 4.0.7 reads the top level's in the block (`"top"`); an opening
+/// would read the reopen's (`"shadow"`).
+#[allow(dead_code)]
+pub fn class_eval_reopen_constant_app() -> emit_and_run::Overlay {
+    with_gem()
+        .write(
+            "config/initializers/shelf_box.rb",
+            "TokenSource = \"top\"\n\nclass Shelf::Box\n  TokenSource = \"shadow\"\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    TokenSource\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n",
+        )
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The gem's class with a constant of its own, and a block whose method
+/// reads that name bare. The block's lexical scope is the top level, so
+/// Ruby looks `TOKEN` up there: `uninitialized constant TOKEN`, not the
+/// gem's `Shelf::Box::TOKEN`.
+#[allow(dead_code)]
+pub fn class_eval_bare_constant_app() -> emit_and_run::Overlay {
+    let lib = SHELF.replace("  class Box\n", "  class Box\n    TOKEN = \"gem\"\n\n");
+    with_gem_lib(&lib)
+        .write("config/initializers/shelf_box.rb", "Shelf::Box.class_eval do\n  def self.local_tag\n    TOKEN\n  end\nend\n")
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// The gem's `Shelf::Box` inherits a `TokenSource` (from its superclass
+/// `Shelf::Base`, or from a module it includes), and the initializer
+/// defines a top-level `TokenSource` its block reads bare. Ruby 4.0.7
+/// reads the top level's in the block (`"top"`), and the ancestor's in a
+/// `class Shelf::Box` reopen (`"base"`).
+#[allow(dead_code)]
+pub fn class_eval_inherited_constant_apps() -> Vec<emit_and_run::Overlay> {
+    let token = "module TokenSource\n      def self.tag\n        \"base\"\n      end\n    end\n";
+    let superclass = SHELF.replace("  class Box\n", &format!("  class Base\n    {token}  end\n\n  class Box < Base\n"));
+    let included = SHELF.replace("  class Box\n", &format!("  module Tokens\n    {token}  end\n\n  class Box\n    include Tokens\n\n"));
+    let initializer = "module TokenSource\n  def self.tag\n    \"top\"\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    TokenSource.tag\n  end\nend\n";
+    [superclass, included]
+        .iter()
+        .map(|lib| with_gem_lib(lib).write("config/initializers/shelf_box.rb", initializer).write("app/models/article_box.rb", ARTICLE_BOX))
+        .collect()
+}
+
+/// A kept helper whose class body sets a class ivar from a second helper
+/// only the initializer defines (`@tag = TagSource.tag`). Ruby 4.0.7
+/// answers `box / app box / sourced`.
+#[allow(dead_code)]
+pub fn class_eval_class_ivar_helper_app() -> emit_and_run::Overlay {
+    let source = "module TagSource\n  def self.tag\n    \"sourced\"\n  end\nend\n\nclass LabelHelper\n  @tag = TagSource.tag\n\n  def self.tag\n    @tag\n  end\nend\n\nShelf::Box.class_eval do\n  def self.local_tag\n    LabelHelper.tag\n  end\n\n  def self.label\n    \"app box\"\n  end\nend\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", source)
+        .write("app/models/article_box.rb", ARTICLE_BOX)
+}
+
+/// A block the ingest refuses (`defined?` of a call with arguments), then
+/// [`CLASS_EVAL`]. Ruby runs both; the second is a reopen like any other.
+#[allow(dead_code)]
+pub fn refused_then_class_eval_app() -> emit_and_run::Overlay {
+    let refused = "Shelf::Box.class_eval do\n  def self.probe\n    defined?(String.new(1)) ? 1 : 0\n  end\nend\n\n";
+    with_gem()
+        .write("config/initializers/shelf_box.rb", &format!("{refused}{CLASS_EVAL}"))
         .write("app/models/article_box.rb", ARTICLE_BOX)
 }
 

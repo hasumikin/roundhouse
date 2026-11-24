@@ -17,6 +17,12 @@ mod emit_and_run;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;
+#[path = "emit_and_run/multi_json.rs"]
+mod multi_json;
+#[path = "emit_and_run/active_model_serializer_08.rs"]
+mod active_model_serializer_08;
+#[path = "emit_and_run/respond_to_core_class.rs"]
+mod respond_to_core_class;
 #[path = "emit_and_run/deep_stringify_keys.rs"]
 mod deep_stringify_keys;
 #[path = "emit_and_run/fixture_explicit_id.rs"]
@@ -626,6 +632,8 @@ mod hash_fetch_one_arg;
 mod numericality_unknown_option;
 #[path = "emit_and_run/belongs_to_nil_writer.rs"]
 mod belongs_to_nil_writer;
+#[path = "emit_and_run/model_defined_guard.rs"]
+mod model_defined_guard;
 #[path = "emit_and_run/inclusion_duration_literals.rs"]
 mod inclusion_duration_literals;
 #[path = "emit_and_run/validates_constant_splat.rs"]
@@ -20913,6 +20921,16 @@ mod reset_counters;
 mod console_only_definitions;
 #[path = "emit_and_run/open_classes.rs"]
 mod open_classes;
+#[path = "emit_and_run/class_arg_specialize.rs"]
+mod class_arg_specialize;
+#[path = "emit_and_run/scope_hash_tail.rs"]
+mod scope_hash_tail;
+#[path = "emit_and_run/core_subclass_dispatch.rs"]
+mod core_subclass_dispatch;
+#[path = "emit_and_run/paren_call_beside_local.rs"]
+mod paren_call_beside_local;
+#[path = "emit_and_run/string_prepend.rs"]
+mod string_prepend;
 #[path = "emit_and_run/parameterized_mailer.rs"]
 mod parameterized_mailer;
 #[path = "emit_and_run/change_table_migrations.rs"]
@@ -22225,6 +22243,12 @@ mod controller_name_constantize;
 mod class_macro_keyword_rest;
 #[path = "emit_and_run/nested_form_child.rs"]
 mod nested_form_child;
+#[path = "emit_and_run/implicit_namespace_include.rs"]
+mod implicit_namespace_include;
+#[path = "emit_and_run/maybe_ruby_boot.rs"]
+mod maybe_ruby_boot;
+#[path = "emit_and_run/rails_settings_cached.rs"]
+mod rails_settings_cached;
 #[path = "emit_and_run/simple_form.rs"]
 mod simple_form;
 #[path = "emit_and_run/classvar_block_initializers.rs"]
@@ -22291,6 +22315,12 @@ mod has_many_writer;
 mod association_scopes;
 #[path = "emit_and_run/association_relation_calls.rs"]
 mod association_relation_calls;
+#[path = "emit_and_run/concern_association_includers.rs"]
+mod concern_association_includers;
+#[path = "emit_and_run/concern_super_includers.rs"]
+mod concern_super_includers;
+#[path = "emit_and_run/concern_includer_definitions.rs"]
+mod concern_includer_definitions;
 #[path = "emit_and_run/polymorphic_belongs_to_scope.rs"]
 mod polymorphic_belongs_to_scope;
 #[path = "emit_and_run/belongs_to_scope_join.rs"]
@@ -22758,6 +22788,9 @@ mod module_method_missing_includer;
 // Declarations: a rooted class or module name inside a module.
 #[path = "emit_and_run/rooted_class_declarations.rs"]
 mod rooted_class_declarations;
+// A model whose include defines `method_missing`: ActiveRecord's own methods still answer.
+#[path = "emit_and_run/model_method_missing_active_record.rs"]
+mod model_method_missing_active_record;
 #[path = "emit_and_run/token_for_string_key.rs"]
 mod token_for_string_key;
 #[path = "emit_and_run/integer_times_enumerator.rs"]
@@ -22778,9 +22811,17 @@ mod params_compact_blank;
 mod computed_partial_render;
 #[path = "emit_and_run/view_raise_statement.rs"]
 mod view_raise_statement;
+#[path = "emit_and_run/params_string_filter_scalars.rs"]
+mod params_string_filter_scalars;
 #[path = "emit_and_run/hidden_field_autocomplete.rs"]
 mod hidden_field_autocomplete;
 #[path = "emit_and_run/record_as_json_in_literal.rs"]
 mod record_as_json_in_literal;
+#[path = "emit_and_run/empty_base_list_override.rs"]
+mod empty_base_list_override;
+#[path = "emit_and_run/relation_argument.rs"]
+mod relation_argument;
+#[path = "emit_and_run/params_permit_key_args.rs"]
+mod params_permit_key_args;
 #[path = "emit_and_run/previously_was_unchanged_column.rs"]
 mod previously_was_unchanged_column;

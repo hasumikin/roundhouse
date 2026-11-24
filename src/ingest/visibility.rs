@@ -107,16 +107,29 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
     }
     let defines = arms.iter().any(|(_, stmts)| !stmts.is_empty());
     let only_defs = arms.iter().all(|(_, stmts)| {
-        stmts.iter().all(|stmt| {
+        stmts.iter().enumerate().all(|(at, stmt)| {
             definition(stmt).is_some()
                 || conditional_accessor(stmt).is_some()
                 || self_write(stmt).is_some()
+                || (branch_load(stmt).is_some() && marks_an_earlier_def(stmt, &stmts[..at]))
                 || conditional_definition(stmt).is_some()
                 || stmt.as_class_node().is_some()
                 || stmt.as_module_node().is_some()
         })
     });
     (defines && only_defs).then_some((negated, arms))
+}
+
+/// A [`conditional_definition`] whose branches only load: each statement an
+/// `include` of a constant, a `require` of a string, or a nested conditional
+/// of the same kind (#2282). It defines nothing itself.
+pub(super) fn load_only_conditional<'pr>(node: &Node<'pr>) -> Option<(bool, Vec<(Option<Node<'pr>>, Vec<Node<'pr>>)>)> {
+    let (negated, arms) = conditional_definition(node)?;
+    let loads = |stmt: &Node<'_>| {
+        branch_load(stmt).is_some_and(|call| matches!(constant_id_str(&call.name()), "include" | "require"))
+            || load_only_conditional(stmt).is_some()
+    };
+    arms.iter().all(|(_, stmts)| stmts.iter().all(loads)).then_some((negated, arms))
 }
 
 /// A class-body `if` / `unless` whose branches define a method but hold
@@ -187,6 +200,36 @@ fn refused_conditional_definition<'pr>(node: &Node<'pr>) -> Option<(Node<'pr>, &
 }
 
 /// `self.error_status = :ok`: a write through the class's own writer, as a branch runs it.
+/// `include Mod` (of a constant) or `require "lib"` in a load-time conditional's branch (method_source's
+/// `include ReeSourceLocation` / `require 'java'`): it runs only when the branch does, as a `def` there does.
+pub(super) fn branch_load<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    match constant_id_str(&call.name()).as_ref() {
+        "include" => (arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some()).then_some(call),
+        "require" => arg.as_string_node().is_some().then_some(call),
+        // `private :trace_func` after the branch's `def`: the visibility it gives, where the branch runs.
+        "private" | "public" | "protected" => arg.as_symbol_node().is_some().then_some(call),
+        _ => None,
+    }
+}
+
+/// A branch's `private :name` names a method the branch defined before it: Ruby raises NameError for one not yet
+/// defined, which the output, writing the class's own methods first, would not.
+fn marks_an_earlier_def(stmt: &Node<'_>, before: &[Node<'_>]) -> bool {
+    let Some(call) = stmt.as_call_node() else { return true };
+    if !matches!(constant_id_str(&call.name()).as_ref(), "private" | "public" | "protected") {
+        return true;
+    }
+    let Some(sym) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_symbol_node()) else { return false };
+    let name = sym.unescaped();
+    before.iter().any(|b| definition(b).is_some_and(|d| d.receiver().is_none() && d.name().as_slice() == name))
+}
+
 pub(super) fn self_write<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
     let call = stmt.as_call_node()?;
     let name = constant_id_str(&call.name());

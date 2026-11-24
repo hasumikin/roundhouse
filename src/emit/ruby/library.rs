@@ -314,15 +314,9 @@ fn order_openings_by_load(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
-/// The file an opening was read from: the first of its spans that points
-/// at a source.
+/// The file an opening was read from (`LibraryClass::source_span`).
 fn opening_file(lc: &LibraryClass, app: &App) -> Option<String> {
-    let span = std::iter::once(lc.parent_span)
-        .chain(lc.include_spans.iter().copied())
-        .chain(lc.constants.iter().map(|(_, v)| v.span))
-        .chain(lc.methods.iter().map(|m| m.body.span))
-        .chain(lc.unknown_calls.iter().map(|c| c.span))
-        .find(|s| !s.is_synthetic())?;
+    let span = lc.source_span()?;
     let source = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
     Some(normalize_path(&source.path))
 }
@@ -1067,11 +1061,38 @@ struct NestedEmitter<'a> {
 
 impl NestedEmitter<'_> {
     fn write_names(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>) {
-        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name)) {
+        self.write_names_except(out, depth, names, &BTreeSet::new());
+    }
+
+    /// `kept` names the modules left pending (a guard asks whether they are defined yet), and with them every
+    /// pending module that needs one, however far down: writing that one first would write the kept one too.
+    fn write_names_except(&mut self, out: &mut String, depth: usize, names: &BTreeSet<String>, kept: &BTreeSet<String>) {
+        let last = |name: &str| name.rsplit("::").next().unwrap_or(name).to_string();
+        let mut blocked: BTreeSet<String> = kept.clone();
+        loop {
+            let before = blocked.len();
+            for block in &self.pending {
+                if block.requires.iter().any(|r| blocked.contains(&last(r))) {
+                    blocked.insert(last(&block.name));
+                }
+            }
+            if blocked.len() == before {
+                break;
+            }
+        }
+        while let Some(at) = self.pending.iter().position(|block| names.contains(&block.name) && !blocked.contains(&last(&block.name))) {
             let block = self.pending.remove(at);
-            self.write_names(out, depth, &block.requires);
+            self.write_names_except(out, depth, &block.requires, &blocked);
             writeln!(out, "{}", indent_lines(&block.content, depth)).unwrap();
         }
+    }
+
+    fn write_expr_except(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr, kept: &BTreeSet<String>) {
+        if self.pending.is_empty() { return; }
+        let mut paths = BTreeSet::new();
+        walk_load_time_paths(expr, owner, &mut BTreeSet::new(), &mut paths);
+        let names = nested_names_in_paths(owner, &paths, &self.names);
+        self.write_names_except(out, depth, &names, kept);
     }
 
     fn write_expr(&mut self, out: &mut String, depth: usize, owner: &LibraryClass, expr: &Expr) {
@@ -2176,6 +2197,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         && !crate::lower::scope_chain::any_assoc_extensions(&assocs)
         && !wants_model_chain
         && query_arguments.is_empty()
+        && app.relation_params.chained.is_empty()
     {
         return;
     }
@@ -2193,9 +2215,21 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         unique_keys: &unique_keys,
         // The Ruby family's attrs Hash holds a record (see the field).
         owner_objects: true,
+        relation_params: Some(&app.relation_params),
     };
     query_arguments.rewrite(lcs, &regs);
     let sole_includers = app.sole_includer_of_modules();
+    // Concern → the models including it, for a concern two or more models
+    // include (see `shared_concern_copies`).
+    let shared_concerns: crate::det::HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> = app
+        .includers_of_modules()
+        .into_iter()
+        .filter_map(|(module, includers)| {
+            let models: Vec<crate::ident::ClassId> =
+                includers.into_iter().filter(|c| model_named.contains_key(c)).collect();
+            (models.len() > 1).then_some((module, models))
+        })
+        .collect();
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
     for lc in lcs.iter_mut() {
@@ -2369,6 +2403,230 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         // read, for the methods that only read them (a controller's
         // private helper after its `before_action`).
         let ivar_bindings = crate::lower::scope_chain::class_ivar_assoc_bindings(&lc.methods, &assocs);
+        // A concern several models include runs its instance methods on
+        // each of them, and `tokens.create!` there is each includer's own
+        // association: its own foreign key, its own polymorphic type. The
+        // module's one body can't say which, so a method that lowers
+        // differently on this model gets a lowered copy here, which Ruby's
+        // lookup finds ahead of the module's. Each name is settled by the
+        // definition Ruby's lookup finds first: the model's own, else the
+        // first module in its ancestors that defines it, and that module's
+        // last definition of it. Only that one is copied, and only when it
+        // lowers differently here, defaults included; a winner calling
+        // `super` stays in its module, where `super` means what it says.
+        // A winner behind a load-time `if` goes with its condition, along
+        // with every definition of the name in it, when the condition is
+        // one that answers the same in the model (`load_time_stable`).
+        let mut includer_copies: Vec<MethodDef> = Vec::new();
+        let mut carried_conditionals: Vec<crate::dialect::ConditionalDefinitions> = Vec::new();
+        if is_model {
+            let chain = app
+                .models
+                .iter()
+                .find(|m| m.name == lc.name)
+                .map(|m| crate::app::model_include_ancestors(m, &app.library_classes))
+                .unwrap_or_default();
+            let mentions_instance = |e: &Expr| {
+                crate::lower::scope_chain::mentions_scope(e, &names)
+                    || crate::lower::scope_chain::mentions_model_chain_start(e, &models)
+                    || crate::lower::scope_chain::mentions_assoc_constructor(e, &assocs)
+                    || crate::lower::scope_chain::mentions_assoc_lookup(e, &assocs)
+                    || crate::lower::scope_chain::mentions_assoc_alias(e, &assocs)
+                    || crate::lower::scope_chain::mentions_assoc_extension(e, &assocs)
+                    || crate::lower::scope_chain::mentions_model_insert_all(e, &models)
+                    || crate::lower::scope_chain::mentions_assoc_class_method(e, &assocs, &names, &assoc_class_methods)
+            };
+            // The module's query arguments (`Picker.pick(tokens)`, whose
+            // `pick` queries its argument) are seeded as the module's own
+            // body is, read as `owner`'s when there is one.
+            // Grounded first, as `lcs`' own methods are above: `app.library_classes`
+            // still holds the literal reflective call (`Token.public_send(:named, x)`).
+            let lowered = |m: &MethodDef, module: &ClassId, owner: Option<&ClassId>| {
+                let mut out = m.clone();
+                crate::lower::scope_chain::ground_literal_model_dispatch(&mut out.body, app, &assocs);
+                query_arguments.rewrite_method(&mut out, module, owner.unwrap_or(module), &regs);
+                crate::lower::scope_chain::rewrite_call_site(&mut out.body, &regs, None, owner);
+                for d in out.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                    if mentions_instance(d) {
+                        crate::lower::scope_chain::rewrite_call_site(d, &regs, None, owner);
+                    }
+                }
+                out
+            };
+            let mut settled: std::collections::BTreeSet<Symbol> = lc
+                .methods
+                .iter()
+                .filter(|own| own.receiver == MethodReceiver::Instance)
+                .map(|own| own.name.clone())
+                .collect();
+            for id in &chain {
+                let Some(module) = app.library_classes.iter().find(|l| l.is_module && l.name == *id) else { continue };
+                let shared = shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name));
+                let has_super = |m: &MethodDef| {
+                    contains_super(&m.body) || m.params.iter().filter_map(|p| p.default.as_ref()).any(contains_super)
+                };
+                let copy = |m: &MethodDef| {
+                    let mut copy = lowered(m, &module.name, Some(&lc.name));
+                    copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
+                    copy
+                };
+                // Whether `m`, defaults included, lowers differently here.
+                let needs_copy = |m: &MethodDef| {
+                    let module_side = lowered(m, &module.name, None);
+                    let here = lowered(m, &module.name, Some(&lc.name));
+                    format!("{:?}{:?}", here.body, here.params) != format!("{:?}{:?}", module_side.body, module_side.params)
+                };
+                // Last to first: a later `def` of a name replaces an earlier one.
+                for m in module.methods.iter().rev() {
+                    if m.receiver != MethodReceiver::Instance
+                        || m.name.as_str().starts_with("__scope_")
+                        || !settled.insert(m.name.clone())
+                        || !shared
+                    {
+                        continue;
+                    }
+                    let Some(conditional) = module.conditional_definitions.iter().find(|c| c.contains(m)) else {
+                        if !has_super(m) && needs_copy(m) {
+                            includer_copies.push(copy(m));
+                        }
+                        continue;
+                    };
+                    // Ruby took its branch once, as the module loaded; the
+                    // model evaluates the carried condition again, so only
+                    // a condition that answers the same then (`RUBY_VERSION
+                    // >= "3.0"`) is carried. Under any other the name stays
+                    // the module's.
+                    if !load_time_stable(conditional) {
+                        continue;
+                    }
+                    // Every definition of the name in it goes, so each
+                    // branch runs its own last one, as in the module.
+                    let members: Vec<&MethodDef> = module
+                        .methods
+                        .iter()
+                        .filter(|other| other.receiver == m.receiver && other.name == m.name && conditional.contains(other))
+                        .collect();
+                    if members.iter().any(|other| has_super(other)) || !members.iter().any(|other| needs_copy(other)) {
+                        continue;
+                    }
+                    includer_copies.extend(members.into_iter().map(|other| copy(other)));
+                    if !carried_conditionals.iter().any(|c| c.span == conditional.span) {
+                        let mut carried = conditional.clone();
+                        strip_declarations(&mut carried);
+                        carried_conditionals.push(carried);
+                    }
+                }
+            }
+            // A winner whose `super` reaches a concern several models
+            // include stays where it is above, so `super` lands in that
+            // concern's module body, which isn't lowered for any one of
+            // them (#2228). Here the definition it reaches is copied in,
+            // lowered for this model under a private name, and the
+            // winner's `super(...)` calls that copy: a model's own def is
+            // rewritten in place, a module's winner gets a lowered copy of
+            // its own. Only one level: a reached definition that calls
+            // `super` itself, a bare `super`, a block, a definition that
+            // reads its own name (`__method__`), or one behind a load-time
+            // condition all stay as they were.
+            let instance_def = |module: &crate::dialect::LibraryClass, name: &Symbol| {
+                module.methods.iter().rev().find(|m| m.receiver == MethodReceiver::Instance && m.name == *name).cloned()
+            };
+            let modules: Vec<&crate::dialect::LibraryClass> = chain
+                .iter()
+                .filter_map(|id| app.library_classes.iter().find(|l| l.is_module && l.name == *id))
+                .collect();
+            let unconditional = |module: &crate::dialect::LibraryClass, m: &MethodDef| {
+                !module.conditional_definitions.iter().any(|c| c.contains(m))
+            };
+            // The definition a winner's `super` reaches, from `from` on,
+            // when it is one this model needs its own lowered copy of.
+            let reached = |from: usize, name: &Symbol| -> Option<(Symbol, MethodDef)> {
+                let (module, target) =
+                    modules[from..].iter().find_map(|module| instance_def(module, name).map(|m| (*module, m)))?;
+                let shared = shared_concerns.get(&module.name).is_some_and(|models| models.contains(&lc.name));
+                if !shared
+                    || !unconditional(module, &target)
+                    || contains_super(&target.body)
+                    || target.params.iter().filter_map(|p| p.default.as_ref()).any(contains_super)
+                    || target.block_param.is_some()
+                    || target.has_anonymous_block
+                    || contains_yield_or_block(&target.body)
+                    || target.params.iter().filter_map(|p| p.default.as_ref()).any(contains_yield_or_block)
+                {
+                    return None;
+                }
+                let module_side = lowered(&target, &module.name, None);
+                let here = lowered(&target, &module.name, Some(&lc.name));
+                if format!("{:?}{:?}", here.body, here.params) == format!("{:?}{:?}", module_side.body, module_side.params) {
+                    return None;
+                }
+                let short = module.name.0.as_str().rsplit("::").next().unwrap_or_default();
+                let private = Symbol::from(format!("__rh_super_{}_{}", crate::naming::snake_case(short), name.as_str()).as_str());
+                let mut copy = here;
+                copy.name = private.clone();
+                copy.visibility = crate::dialect::MethodVisibility::Private;
+                copy.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
+                Some((private, copy))
+            };
+            let plain_name = |name: &Symbol| {
+                let s = name.as_str();
+                let core = s.strip_suffix('!').or_else(|| s.strip_suffix('?')).unwrap_or(s);
+                !core.is_empty() && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            let calls_super_explicitly = |m: &MethodDef| {
+                contains_super(&m.body)
+                    && supers_all_explicit(&m.body)
+                    && !m.params.iter().filter_map(|p| p.default.as_ref()).any(contains_super)
+            };
+            let mut super_copies: Vec<MethodDef> = Vec::new();
+            // The model's own defs: Ruby keeps the last of each name, and
+            // its `super` starts at the first module.
+            let own_last: crate::det::HashMap<Symbol, usize> = lc
+                .methods
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.receiver == MethodReceiver::Instance)
+                .map(|(i, m)| (m.name.clone(), i))
+                .collect();
+            for (i, own) in lc.methods.iter_mut().enumerate() {
+                if own_last.get(&own.name) != Some(&i)
+                    || !plain_name(&own.name)
+                    || !calls_super_explicitly(own)
+                {
+                    continue;
+                }
+                let Some((private, copy)) = reached(0, &own.name) else { continue };
+                replace_supers(&mut own.body, &private);
+                super_copies.push(copy);
+            }
+            // A module's winner: the first module that defines the name,
+            // when the model doesn't. Its `super` starts at the next one.
+            let mut module_settled: std::collections::BTreeSet<Symbol> = own_last.keys().cloned().collect();
+            for (index, module) in modules.iter().enumerate() {
+                let names: Vec<Symbol> = module
+                    .methods
+                    .iter()
+                    .filter(|m| m.receiver == MethodReceiver::Instance)
+                    .map(|m| m.name.clone())
+                    .collect();
+                for name in names {
+                    if !module_settled.insert(name.clone()) || !plain_name(&name) {
+                        continue;
+                    }
+                    let Some(winner) = instance_def(module, &name) else { continue };
+                    if !unconditional(module, &winner) || !calls_super_explicitly(&winner) {
+                        continue;
+                    }
+                    let Some((private, copy)) = reached(index + 1, &name) else { continue };
+                    let mut here = lowered(&winner, &module.name, Some(&lc.name));
+                    here.enclosing_class = Some(Symbol::from(lc.name.0.as_str().rsplit("::").next().unwrap_or_default()));
+                    replace_supers(&mut here.body, &private);
+                    includer_copies.push(here);
+                    super_copies.push(copy);
+                }
+            }
+            includer_copies.extend(super_copies);
+        }
         for m in &mut lc.methods {
             // A `__scope_` entry's forward body already carries `__rel`
             // exactly once — never re-thread it (re-entrancy guard for
@@ -2394,6 +2652,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                     || crate::lower::scope_chain::mentions_assoc_alias(e, &assocs)
                     || crate::lower::scope_chain::mentions_assoc_extension(e, &assocs)
                     || crate::lower::scope_chain::mentions_model_insert_all(e, &models)
+                    || crate::lower::scope_chain::mentions_relation_argument(e, &app.relation_params)
                     || crate::lower::scope_chain::mentions_assoc_class_method(
                         e,
                         &assocs,
@@ -2438,6 +2697,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 }
             }
         }
+        lc.methods.extend(includer_copies);
+        lc.conditional_definitions.extend(carried_conditionals);
     }
     drop(_span);
     let _span = crate::timings::begin("scope lowering: variants");
@@ -10044,6 +10305,7 @@ fn emit_library_class_decl_inner(
                 Method(&'a MethodDef),
                 Nested(&'a crate::dialect::ConditionalDefinitions),
                 Declared(&'a ClassId),
+                Statement(&'a crate::expr::Expr),
             }
             let mut parts: Vec<(u32, Part<'_>)> = Vec::new();
             for member in &arm.methods {
@@ -10053,12 +10315,17 @@ fn emit_library_class_decl_inner(
             }
             parts.extend(arm.nested.iter().map(|n| (n.span.start, Part::Nested(n))));
             parts.extend(arm.declarations.iter().map(|d| (d.start, Part::Declared(&d.name))));
+            // A branch's `include` / `require`, which runs where the branch does.
+            parts.extend(arm.statements.iter().filter(|st| matches!(&*st.node,
+                crate::expr::ExprNode::Send { recv: None, method, .. } if matches!(method.as_str(), "include" | "require" | "private" | "public" | "protected")))
+                .map(|st| (st.span.start, Part::Statement(st))));
             parts.sort_by_key(|(start, _)| *start);
             for (_, part) in parts {
                 match part {
                     Part::Method(method) => render_library_method(s, method, &inner),
                     Part::Nested(nested) => write(s, nested, lc, &inner, require_of),
                     Part::Declared(name) => writeln!(s, "{inner}{}", require_of(name)).unwrap(),
+                    Part::Statement(st) => writeln!(s, "{inner}{}", super::emit_expr(st)).unwrap(),
                 }
             }
         }
@@ -10066,6 +10333,46 @@ fn emit_library_class_decl_inner(
     }
     let write_conditional = |s: &mut String, index: usize| {
         written_conditionals.borrow_mut().push(index);
+        // Not before the nested modules its branches `include`: those are written ahead of the conditional.
+        fn statements<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.statements.iter());
+                for n in &arm.nested {
+                    statements(n, out);
+                }
+            }
+        }
+        let mut sts = Vec::new();
+        statements(&lc.conditional_definitions[index], &mut sts);
+        // Not ahead of a guard that asks for the module (`const_defined?(:Feature)`): writing it first would flip the branch.
+        fn conditions<'c>(c: &'c crate::dialect::ConditionalDefinitions, out: &mut Vec<&'c Expr>) {
+            for arm in &c.arms {
+                out.extend(arm.condition.iter());
+                for n in &arm.nested {
+                    conditions(n, out);
+                }
+            }
+        }
+        fn names_in(e: &Expr, out: &mut BTreeSet<String>) {
+            match &*e.node {
+                ExprNode::Const { path } => out.extend(path.iter().map(|p| p.as_str().to_string())),
+                ExprNode::Lit { value: Literal::Sym { value } } => {
+                    out.insert(value.as_str().to_string());
+                }
+                ExprNode::Lit { value: Literal::Str { value } } => out.extend(value.split("::").map(str::to_string)),
+                _ => {}
+            }
+            e.node.for_each_child(&mut |c| names_in(c, out));
+        }
+        let mut conds = Vec::new();
+        conditions(&lc.conditional_definitions[index], &mut conds);
+        let mut asked = BTreeSet::new();
+        for c in conds {
+            names_in(c, &mut asked);
+        }
+        for st in sts {
+            nested.borrow_mut().write_expr_except(s, depth, lc, st, &asked);
+        }
         write(s, &lc.conditional_definitions[index], lc, &body_pad, &require_of);
     };
     let render_conditional = |s: &mut String, m: &MethodDef| -> bool {
@@ -11715,6 +12022,8 @@ fn require_path_for_body_const(
         // `runtime/ruby/rack_utils.rb` for spinel and the rack gem's own
         // on the ruby family (`project::ruby_runtime_files`). Anchored so
         // a file that names it loads the one its tree has.
+        // `Rack::BodyProxy` has a port of its own (`runtime/ruby/rack_body_proxy.rb`).
+        "Rack" if path.get(1).is_some_and(|n| n == "BodyProxy") => Some("runtime/rack_body_proxy".to_string()),
         "Rack" => Some("runtime/rack_utils".to_string()),
         // `SQLite3::Database` — the gem on the ruby family, the FFI port
         // (`runtime/spinel/sqlite3_database.rb`) on spinel; one require
@@ -13996,4 +14305,87 @@ mod insert_rel_param_tests {
         let names: Vec<&str> = fn_ty.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["tags", "__rel", "opts"]);
     }
+}
+
+/// A module's load-time conditional as an includer carries it with its
+/// copied definitions: the classes its branches declare stay the module's.
+fn strip_declarations(conditional: &mut crate::dialect::ConditionalDefinitions) {
+    for arm in &mut conditional.arms {
+        arm.declarations.clear();
+        arm.nested.iter_mut().for_each(strip_declarations);
+    }
+}
+
+/// Whether every condition of `conditional`, nested ones included, gives
+/// the same answer whenever it is evaluated: literals and constants
+/// compared with each other (`RUBY_VERSION >= "3.0"`,
+/// `Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.1")`), joined
+/// with `&&`, `||` and `!`. A call such as `method_defined?(:x)` answers
+/// differently once other modules are in.
+fn load_time_stable(conditional: &crate::dialect::ConditionalDefinitions) -> bool {
+    fn stable(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } | ExprNode::Const { .. } => true,
+            ExprNode::BoolOp { left, right, .. } => stable(left) && stable(right),
+            ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+                let compares = matches!(method.as_str(), "==" | "!=" | ">=" | "<=" | ">" | "<" | "<=>" | "!");
+                let version = method.as_str() == "new" && matches!(&*recv.node, ExprNode::Const { .. });
+                (compares || version) && stable(recv) && args.iter().all(stable)
+            }
+            _ => false,
+        }
+    }
+    conditional.arms.iter().all(|arm| {
+        arm.condition.as_ref().is_none_or(stable) && arm.nested.iter().all(load_time_stable)
+    })
+}
+
+/// Whether every `super` in `expr` passes its arguments (`super(x)`), not
+/// the current method's (`super`).
+fn supers_all_explicit(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Super { args: None }) {
+        return false;
+    }
+    let mut all = true;
+    expr.node.for_each_child(&mut |child| all = all && supers_all_explicit(child));
+    all
+}
+
+/// Each `super(args)` in `expr` becomes `private(args)` on self.
+fn replace_supers(expr: &mut Expr, private: &Symbol) {
+    if let ExprNode::Super { args: Some(args) } = &*expr.node {
+        let args = args.clone();
+        *expr.node = ExprNode::Send { recv: None, method: private.clone(), args, block: None, parenthesized: true };
+    }
+    expr.node.for_each_child_mut(&mut |child| replace_supers(child, private));
+}
+
+/// Any `yield`, `block_given?` (bare or on `self`), `__method__` or
+/// `__callee__` in `expr`, at any depth: what a definition called under
+/// another name, without the caller's block, would answer differently.
+fn contains_yield_or_block(expr: &Expr) -> bool {
+    let on_self = |recv: &Option<Expr>| recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+    let found_here = match &*expr.node {
+        ExprNode::Yield { .. } => true,
+        ExprNode::Send { recv, method, .. } => {
+            on_self(recv) && matches!(method.as_str(), "block_given?" | "__method__" | "__callee__")
+        }
+        _ => false,
+    };
+    if found_here {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found = found || contains_yield_or_block(child));
+    found
+}
+
+/// Any `super` in `expr`, at any depth.
+fn contains_super(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Super { .. }) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found = found || contains_super(child));
+    found
 }
